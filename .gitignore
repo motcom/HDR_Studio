@@ -1,0 +1,5 @@
+/target
+/native/vendor
+/native/build
+/tests/output
+__pycache__/
