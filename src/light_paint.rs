@@ -164,6 +164,46 @@ impl PickMesh {
         Self { nodes, triangles }
     }
 
+    pub fn ray_texel_count(&self) -> usize {
+        self.nodes.len() * 2 + self.triangles.len() * 3
+    }
+
+    pub fn write_ray_texels(&self, vertices: &[Vertex], texels: &mut [[u32; 4]]) -> i32 {
+        let node_count = self.nodes.len();
+        self.write_ray_node(0, node_count, texels);
+        // GPU leaf ranges use the same triangle ordering as the CPU BVH.
+        let (triangles, _) = texels[node_count * 2..].as_chunks_mut::<3>();
+        for (&index, triangle) in self.triangles.iter().zip(triangles) {
+            for (i, vertex) in vertices[index * 3..][..3].iter().enumerate() {
+                let [x, y, z] = vertex.position.map(f32::to_bits);
+                let [nx, ny, nz] = vertex
+                    .normal
+                    .map(|value| (value.clamp(-1.0, 1.0) * 511.0).round() as i32 as u32 & 0x3ff);
+                triangle[i] = [x, y, z, nx | (ny << 10) | (nz << 20)];
+            }
+        }
+        node_count as i32
+    }
+
+    fn write_ray_node(&self, index: usize, escape: usize, texels: &mut [[u32; 4]]) {
+        let (bounds, start, end) = match self.nodes[index] {
+            PickNode::Leaf { bounds, start, end } => (bounds, start as u32, end as u32),
+            PickNode::Branch {
+                bounds,
+                left,
+                right,
+            } => {
+                self.write_ray_node(left, right, texels);
+                self.write_ray_node(right, escape, texels);
+                (bounds, u32::MAX, escape as u32)
+            }
+        };
+        let [x, y, z] = bounds.min.as_vec3().to_array().map(f32::to_bits);
+        texels[index * 2] = [x, y, z, start];
+        let [x, y, z] = bounds.max.as_vec3().to_array().map(f32::to_bits);
+        texels[index * 2 + 1] = [x, y, z, end];
+    }
+
     fn build(
         nodes: &mut Vec<PickNode>,
         triangles: &mut [usize],

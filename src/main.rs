@@ -4,8 +4,10 @@ mod camera;
 mod environment;
 mod hdr_editor;
 mod light_paint;
+mod preview;
 mod renderer;
 mod scene;
+mod settings;
 
 #[cfg(test)]
 mod tests;
@@ -50,7 +52,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0]),
         renderer: eframe::Renderer::Glow,
-        depth_buffer: 24,
         ..Default::default()
     };
     eframe::run_native(

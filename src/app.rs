@@ -1,14 +1,16 @@
 use crate::{
     camera::Camera,
+    environment::HdrImage,
     hdr_editor::Editor,
     light_paint::LightPaint,
-    renderer::Renderer,
+    preview::{Preview, Request},
     scene::{self, Scene},
+    settings::Settings,
 };
-use eframe::{egui, glow};
+use eframe::egui;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     time::Instant,
 };
 
@@ -26,9 +28,9 @@ struct LightStroke {
 }
 
 pub struct App {
-    gl: Arc<glow::Context>,
-    renderer: Arc<Mutex<Renderer>>,
-    scene: Option<Scene>,
+    preview: Preview,
+    environment: Option<Arc<HdrImage>>,
+    scene: Option<Arc<Scene>>,
     loading: Option<mpsc::Receiver<LoadResult>>,
     camera: usize,
     seconds: f64,
@@ -36,6 +38,7 @@ pub struct App {
     elapsed: f64,
     initial: Option<PathBuf>,
     editor: Editor,
+    settings: Option<Settings>,
     inspector_tab: InspectorTab,
     light_paint: LightPaint,
     light_stroke: Option<LightStroke>,
@@ -44,11 +47,14 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Result<Self, String> {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        let gl = cc.gl.clone().ok_or("OpenGL is required")?;
-        let renderer = Arc::new(Mutex::new(Renderer::new(&gl)?));
+        let settings = Settings::open();
+        let mut editor = Editor::default();
+        if let Some(settings) = &settings {
+            editor.lighting = settings.lighting();
+        }
         Ok(Self {
-            gl,
-            renderer,
+            preview: Preview::new(&cc.egui_ctx)?,
+            environment: None,
             scene: None,
             loading: None,
             camera: 0,
@@ -56,7 +62,8 @@ impl App {
             error: None,
             elapsed: 0.0,
             initial,
-            editor: Editor::default(),
+            editor,
+            settings,
             inspector_tab: InspectorTab::Lighting,
             light_paint: LightPaint::default(),
             light_stroke: None,
@@ -229,6 +236,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.editor.poll();
+        self.preview.poll(ctx);
         if let Some(path) = self.initial.take() {
             if is_hdr(&path) {
                 self.editor.import(path, ctx);
@@ -242,20 +250,10 @@ impl eframe::App for App {
                     self.loading = None;
                     match result {
                         Ok((scene, elapsed)) => {
-                            match self
-                                .renderer
-                                .lock()
-                                .unwrap()
-                                .upload(&self.gl, &scene.vertices)
-                            {
-                                Ok(()) => {
-                                    self.light_stroke = None;
-                                    self.camera = 0;
-                                    self.elapsed = elapsed;
-                                    self.scene = Some(scene);
-                                }
-                                Err(e) => self.error = Some(e),
-                            }
+                            self.light_stroke = None;
+                            self.camera = 0;
+                            self.elapsed = elapsed;
+                            self.scene = Some(Arc::new(scene));
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -319,13 +317,19 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .id_salt(egui::Id::new("inspector-scroll").with(self.inspector_tab as u8))
                     .show(ui, |ui| match self.inspector_tab {
-                        InspectorTab::Lighting => self.editor.lighting_controls(ui),
+                        InspectorTab::Lighting => {
+                            self.editor.lighting_controls(ui);
+                            if let Some(([width, height], scale, samples)) = self.preview.quality() {
+                                ui.small(format!("Preview: {width} × {height} px ({scale}%) · {samples} shadow samples"));
+                            }
+                        }
                         InspectorTab::FixedCamera => self.camera_controls(ui),
                         InspectorTab::HdrEnvironment => self.editor.environment_controls(ui),
                     });
             });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            if let Some(error) = &self.error {
+            if let Some(error) = self.error.as_ref().or(self.preview.warning.as_ref())
+                .or(self.settings.as_ref().and_then(|settings| settings.error.as_ref())) {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             } else {
                 ui.label(
@@ -370,7 +374,7 @@ impl eframe::App for App {
                     ui.small(&self.placement_status);
                 });
                 let space = ui.available_rect_before_wrap();
-                if let Some(camera) = camera {
+                if let Some(camera) = camera && let Some(scene) = self.scene.clone() {
                     let size = if space.width() / space.height() > camera.aspect as f32 {
                         egui::vec2(space.height() * camera.aspect as f32, space.height())
                     } else {
@@ -386,18 +390,13 @@ impl eframe::App for App {
                     }
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_rgb(35, 40, 49));
-                    let renderer = self.renderer.clone();
-                    let lighting = self.editor.lighting;
-                    ui.painter().add(egui::PaintCallback {
-                        rect,
-                        callback: Arc::new(eframe::egui_glow::CallbackFn::new(
-                            move |_info, painter| {
-                                renderer
-                                    .lock()
-                                    .unwrap()
-                                    .paint(painter.gl(), &camera, lighting);
-                            },
-                        )),
+                    self.preview.show(ui, rect, Request {
+                        scene,
+                        camera: self.camera,
+                        environment: self.environment.clone(),
+                        lighting: self.editor.lighting,
+                        size: [0; 2],
+                        refinement: 0,
                     });
                     ui.painter().rect_stroke(
                         rect,
@@ -425,11 +424,19 @@ impl eframe::App for App {
                 self.open(path, ctx);
             }
         }
-        self.editor.refresh(ctx, &self.gl, &self.renderer);
+        if let Some(image) = self.editor.refresh(ctx) {
+            self.environment = Some(image);
+        }
+        if !ctx.input(|input| input.pointer.any_down())
+            && let Some(settings) = &mut self.settings
+        {
+            settings.save(self.editor.lighting);
+        }
     }
-    fn on_exit(&mut self, gl: Option<&glow::Context>) {
-        if let Some(gl) = gl {
-            self.renderer.lock().unwrap().destroy(gl);
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(settings) = &mut self.settings {
+            settings.save(self.editor.lighting);
         }
     }
 }

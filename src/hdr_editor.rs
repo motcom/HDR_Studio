@@ -3,12 +3,12 @@ use crate::{
         BlendMode, BoxInterpolation, Document, FalloffCurve, FalloffPreset, HdrImage, Light,
         LightMapping, LightShape, PREVIEW_HEIGHT, PREVIEW_WIDTH,
     },
-    renderer::{Lighting, Renderer},
+    renderer::{Lighting, PREVIEW_SCALE_OPTIONS, SHADOW_SAMPLE_OPTIONS},
 };
-use eframe::{egui, glow};
+use eframe::egui;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
 };
 
 fn falloff_controls(
@@ -309,6 +309,49 @@ fn hotspot_controls(ui: &mut egui::Ui, light: &mut Light) -> bool {
     changed
 }
 
+fn draw_lat_long_guide(painter: &egui::Painter, rect: egui::Rect) {
+    let shadow = egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(160));
+    let line = egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(160));
+    for stroke in [shadow, line] {
+        painter.hline(rect.x_range(), rect.center().y, stroke);
+    }
+
+    let red = egui::Color32::from_rgb(255, 105, 112);
+    let green = egui::Color32::from_rgb(112, 224, 132);
+    let blue = egui::Color32::from_rgb(105, 169, 255);
+
+    for (direction, name, color) in [
+        (glam::Vec3::NEG_X, "X-", red),
+        (glam::Vec3::NEG_Z, "Z-", blue),
+        (glam::Vec3::X, "X+", red),
+        (glam::Vec3::Z, "Z+", blue),
+    ] {
+        let uv = crate::environment::panorama_uv(direction);
+        // The X- meridian is the panorama seam and appears on both edges.
+        for u in [uv.x, uv.x + 1.0].into_iter().take_while(|&u| u <= 1.0) {
+            let x = rect.left() + rect.width() * u;
+            let width: f32 = if u == 0.0 || u == 1.0 { 2.0 } else { 1.0 };
+            for stroke in [shadow, egui::Stroke::new(width, color)] {
+                painter.vline(x, rect.y_range(), stroke);
+            }
+            let label =
+                painter.layout_no_wrap(name.to_owned(), egui::FontId::monospace(12.0), color);
+            let left = (x - label.size().x * 0.5)
+                .min(rect.right() - label.size().x - 5.0)
+                .max(rect.left() + 5.0);
+            let label_rect =
+                egui::Rect::from_min_size(egui::pos2(left, rect.top() + 5.0), label.size());
+            painter.rect_filled(label_rect.expand2(egui::vec2(3.0, 1.0)), 2.0, shadow.color);
+            painter.galley(label_rect.min, label, color);
+        }
+    }
+    for y in [rect.top(), rect.bottom()] {
+        for stroke in [shadow, egui::Stroke::new(2.0_f32, green)] {
+            painter.hline(rect.x_range(), y, stroke);
+        }
+    }
+}
+
 fn draw_light_guide(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -363,6 +406,7 @@ fn draw_light_guide(
                 }),
             );
         }
+        LightShape::Image => return,
     }
     if selected {
         let core = to_map(if light.shape == LightShape::Gradient {
@@ -397,11 +441,12 @@ pub struct Editor {
     preview_job: Option<mpsc::Receiver<HdrImage>>,
     texture: Option<egui::TextureHandle>,
     canvas_view: CanvasView,
+    show_lat_long_guide: bool,
     falloff_texture: Option<(usize, egui::TextureHandle)>,
     falloff_stale: bool,
     import: mpsc::Receiver<Result<(HdrImage, String), String>>,
     import_tx: mpsc::Sender<Result<(HdrImage, String), String>>,
-    importing: bool,
+    importing: Option<u32>,
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     export_width: u32,
     drag_offset: [f32; 2],
@@ -420,11 +465,12 @@ impl Default for Editor {
             preview_job: None,
             texture: None,
             canvas_view: CanvasView::Hdr,
+            show_lat_long_guide: true,
             falloff_texture: None,
             falloff_stale: true,
             import,
             import_tx,
-            importing: false,
+            importing: None,
             export: None,
             export_width: 2048,
             drag_offset: [0.; 2],
@@ -435,6 +481,14 @@ impl Default for Editor {
     }
 }
 impl Editor {
+    fn add_light(&mut self) -> usize {
+        let index = self.document.add_light();
+        self.selected = Some(index);
+        self.lighting.default_light = false;
+        self.dirty = true;
+        index
+    }
+
     pub fn place_light(&mut self, direction: glam::Vec3, new_light: bool) -> Option<&str> {
         let existing = self.selected.filter(|&index| {
             !new_light
@@ -442,18 +496,18 @@ impl Editor {
                     .document
                     .lights
                     .get(index)
-                    .is_some_and(|light| light.enabled)
+                    .is_some_and(|light| light.enabled && light.shape != LightShape::Image)
         });
         let index = match existing {
             Some(index) => index,
-            None if self.document.lights.len() < 32 => self.document.add_light(),
+            None if self.document.lights.len() < 32 => self.add_light(),
             None => return None,
         };
         let uv = crate::environment::panorama_uv(direction);
         let light = &mut self.document.lights[index];
         let u = (uv.x - self.document.rotation / 360.0).rem_euclid(1.0);
         let v = uv.y.clamp(0.0, 1.0);
-        self.dirty |= existing.is_none() || u != light.u || v != light.v;
+        self.dirty |= u != light.u || v != light.v;
         light.u = u;
         light.v = v;
         self.selected = Some(index);
@@ -461,11 +515,20 @@ impl Editor {
     }
 
     pub fn import(&mut self, path: PathBuf, ctx: &egui::Context) {
-        if self.importing {
+        if self.importing.is_some() || self.document.lights.len() >= 32 {
             return;
         }
+        let index = self.add_light();
+        let layer = &mut self.document.lights[index];
+        layer.shape = LightShape::Image;
+        layer.name = format!("Image {}", layer.id);
+        let id = layer.id;
+        self.import_image(path, id, ctx);
+    }
+
+    fn import_image(&mut self, path: PathBuf, id: u32, ctx: &egui::Context) {
         self.error = None;
-        self.importing = true;
+        self.importing = Some(id);
         let tx = self.import_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -484,16 +547,25 @@ impl Editor {
     }
     pub fn poll(&mut self) {
         if let Ok(result) = self.import.try_recv() {
-            self.importing = false;
-            match result {
-                Ok((image, name)) => {
-                    self.status = format!("Loaded {} × {}", image.width, image.height);
-                    self.export_width = image.width;
-                    self.document.base = Some(Arc::new(image));
-                    self.document.source = name;
-                    self.dirty = true;
+            let target = self.importing.take();
+            if let Some(layer) = self
+                .document
+                .lights
+                .iter_mut()
+                .find(|layer| Some(layer.id) == target)
+            {
+                match result {
+                    Ok((image, name)) => {
+                        self.status = format!("Loaded {} × {}", image.width, image.height);
+                        if layer.name == format!("Image {}", layer.id) {
+                            layer.name = name.clone();
+                        }
+                        layer.image_layer.image = Some(Arc::new(image));
+                        layer.image_layer.source = name;
+                        self.dirty = true;
+                    }
+                    Err(e) => self.error = Some(e),
                 }
-                Err(e) => self.error = Some(e),
             }
         }
         if let Some(rx) = &self.export {
@@ -517,34 +589,67 @@ impl Editor {
         ui.checkbox(&mut self.lighting.default_light,"Default lighting").on_hover_text("Turn off the built-in key light and ambient fill to judge the HDR environment alone.");
         ui.checkbox(&mut self.lighting.environment, "HDR lighting");
         ui.checkbox(&mut self.lighting.background, "HDR background");
+        ui.checkbox(&mut self.lighting.soft_shadows, "HDR soft shadows")
+            .on_hover_text("Cast shadows from the HDR environment onto model surfaces.");
+        ui.checkbox(&mut self.lighting.floor_shadows, "Show floor shadows")
+            .on_hover_text("Catch HDR shadows on a floor at the bottom of the model.");
+        preview_quality_options(
+            ui,
+            "Min shadow samples",
+            &mut self.lighting.shadow_samples,
+            &SHADOW_SAMPLE_OPTIONS,
+            0,
+            "",
+        );
+        self.lighting.idle_shadow_samples = self
+            .lighting
+            .idle_shadow_samples
+            .max(self.lighting.shadow_samples);
+        preview_quality_options(
+            ui,
+            "Idle shadow samples",
+            &mut self.lighting.idle_shadow_samples,
+            &SHADOW_SAMPLE_OPTIONS,
+            self.lighting.shadow_samples,
+            "",
+        );
+        preview_quality_options(
+            ui,
+            "Min preview resolution",
+            &mut self.lighting.preview_scale,
+            &PREVIEW_SCALE_OPTIONS,
+            0,
+            "%",
+        );
+        self.lighting.idle_preview_scale = self
+            .lighting
+            .idle_preview_scale
+            .max(self.lighting.preview_scale);
+        preview_quality_options(
+            ui,
+            "Idle preview resolution",
+            &mut self.lighting.idle_preview_scale,
+            &PREVIEW_SCALE_OPTIONS,
+            self.lighting.preview_scale,
+            "%",
+        );
         ui.collapsing("Preview material", |ui| {
+            ui.checkbox(&mut self.lighting.ray_reflections, "Ray-traced reflections")
+                .on_hover_text("Trace one reflection to nearby surfaces when HDR lighting is on.");
             ui.add(egui::Slider::new(&mut self.lighting.roughness, 0.0..=1.0).text("Roughness"));
             ui.add(egui::Slider::new(&mut self.lighting.metallic, 0.0..=1.0).text("Metallic"));
             ui.small("Preview material only; not part of the exported HDR.");
         });
+        if !self.lighting.environment
+            && (self.lighting.soft_shadows
+                || self.lighting.floor_shadows
+                || self.lighting.ray_reflections)
+        {
+            ui.small("Enable HDR lighting to preview HDR shadows and reflections.");
+        }
     }
 
     pub fn environment_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.importing, egui::Button::new("Load HDR / EXR…"))
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("HDR environment", &["hdr", "exr"])
-                    .pick_file()
-            {
-                self.import(path, ui.ctx());
-            }
-            if self.importing {
-                ui.spinner();
-            }
-        });
-        ui.label(&self.document.source);
-        if self.document.base.is_some() && ui.small_button("Remove base image").clicked() {
-            self.document.base = None;
-            self.document.source = "Black environment".into();
-            self.dirty = true;
-        }
         self.dirty |= ui
             .add(egui::Slider::new(&mut self.document.exposure, -10.0..=10.0).text("Exposure (EV)"))
             .changed();
@@ -563,8 +668,7 @@ impl Editor {
                 )
                 .clicked()
             {
-                self.selected = Some(self.document.add_light());
-                self.dirty = true;
+                self.add_light();
             }
         });
         if !self.document.lights.is_empty() {
@@ -605,6 +709,13 @@ impl Editor {
                                         LightShape::Round => {
                                             ui.painter().circle_filled(swatch.center(), 6.5, color);
                                         }
+                                        LightShape::Image => {
+                                            ui.painter().rect_filled(
+                                                swatch.shrink2(egui::vec2(0.0, 3.0)),
+                                                2.0,
+                                                ui.visuals().weak_text_color(),
+                                            );
+                                        }
                                     }
                                     let name_width = (ui.available_width() - 59.0).max(30.0);
                                     if ui
@@ -619,7 +730,11 @@ impl Editor {
                                     {
                                         self.selected = Some(index);
                                     }
-                                    ui.small(light.blend.label());
+                                    ui.small(if light.shape == LightShape::Image {
+                                        "Image"
+                                    } else {
+                                        light.blend.label()
+                                    });
                                 });
                             });
                     }
@@ -658,116 +773,180 @@ impl Editor {
                 }
             });
         }
+        let mut image_import = None;
         if let Some(index) = self.selected {
             ui.separator();
             ui.strong("Layer properties");
             let light = &mut self.document.lights[index];
             ui.text_edit_singleline(&mut light.name);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Shape");
                 self.dirty |= ui
-                    .selectable_value(&mut light.shape, LightShape::Rectangle, "Rectangle")
+                    .selectable_value(&mut light.shape, LightShape::Round, "Round")
                     .changed();
                 self.dirty |= ui
-                    .selectable_value(&mut light.shape, LightShape::Round, "Round")
+                    .selectable_value(&mut light.shape, LightShape::Rectangle, "Rectangle")
                     .changed();
                 self.dirty |= ui
                     .selectable_value(&mut light.shape, LightShape::Gradient, "Gradient")
                     .on_hover_text("A rectangular light with a gradient from side to side")
                     .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label("Blend");
-                egui::ComboBox::from_id_salt("blend-mode")
-                    .selected_text(light.blend.label())
-                    .show_ui(ui, |ui| {
-                        for mode in BlendMode::ALL {
-                            self.dirty |= ui
-                                .selectable_value(&mut light.blend, mode, mode.label())
-                                .changed();
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Color");
-                self.dirty |= ui.color_edit_button_rgb(&mut light.color).changed();
-            });
-            self.dirty |= ui
-                .add(
-                    egui::Slider::new(&mut light.intensity, 0.0..=10000.0)
-                        .logarithmic(true)
-                        .text("Intensity"),
-                )
-                .changed();
-            self.dirty |= ui
-                .add(egui::Slider::new(&mut light.width_degrees, 1.0..=180.0).text("Width (°)"))
-                .changed();
-            self.dirty |= ui
-                .add(egui::Slider::new(&mut light.height_degrees, 1.0..=90.0).text("Height (°)"))
-                .changed();
-            let directional = light.shape == LightShape::Gradient;
-            let box_gradient = light.shape == LightShape::Rectangle;
-            egui::CollapsingHeader::new(if directional {
-                "Gradient curve"
-            } else if box_gradient {
-                "Box Gradient"
-            } else {
-                "Falloff curve"
-            })
-            .id_salt("light-curve")
-            .default_open(true)
-            .show(ui, |ui| {
-                if box_gradient {
-                    self.dirty |= ui
-                        .checkbox(&mut light.box_link_axes, "Link horizontal and vertical")
-                        .changed();
-                    if !light.box_link_axes {
-                        light
-                            .box_vertical
-                            .get_or_insert_with(|| light.falloff.clone());
-                        ui.label("Horizontal curve");
-                    }
-                }
-                let curve = if directional {
-                    &mut light.gradient_curve
-                } else {
-                    &mut light.falloff
-                };
-                ui.push_id("main-ramp", |ui| {
-                    self.dirty |= falloff_controls(ui, curve, directional, box_gradient);
-                });
-                if box_gradient
-                    && !light.box_link_axes
-                    && let Some(vertical) = &mut light.box_vertical
+                if ui
+                    .selectable_value(&mut light.shape, LightShape::Image, "Image")
+                    .changed()
                 {
-                    egui::CollapsingHeader::new("Vertical curve")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            self.dirty |= falloff_controls(ui, vertical, false, true);
-                        });
+                    if light.name == format!("Round {}", light.id) {
+                        light.name = format!("Image {}", light.id);
+                    }
+                    self.dirty = true;
                 }
             });
-            egui::CollapsingHeader::new("Mapping, hotspot & cut")
+            if light.shape == LightShape::Image {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.importing.is_none(),
+                            egui::Button::new("Load HDR / EXR…"),
+                        )
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("HDR environment", &["hdr", "exr"])
+                            .pick_file()
+                    {
+                        image_import = Some((path, light.id));
+                    }
+                    if self.importing == Some(light.id) {
+                        ui.spinner();
+                    }
+                });
+                let layer = &mut light.image_layer;
+                if !layer.source.is_empty() {
+                    ui.small(&layer.source);
+                }
+                self.dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut layer.rotation, -180.0..=180.0)
+                            .text("Image rotation (°)"),
+                    )
+                    .changed();
+                self.dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut layer.exposure, -10.0..=10.0)
+                            .text("Image exposure (EV)"),
+                    )
+                    .changed();
+                self.dirty |= ui
+                    .add(egui::Slider::new(&mut layer.alpha, 0.0..=1.0).text("Alpha"))
+                    .changed();
+                self.dirty |= ui
+                    .checkbox(&mut layer.linear, "Linear")
+                    .on_hover_text("On: use linear RGB. Off: decode the image as sRGB.")
+                    .changed();
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Blend");
+                    egui::ComboBox::from_id_salt("blend-mode")
+                        .selected_text(light.blend.label())
+                        .show_ui(ui, |ui| {
+                            for mode in BlendMode::ALL {
+                                self.dirty |= ui
+                                    .selectable_value(&mut light.blend, mode, mode.label())
+                                    .changed();
+                            }
+                        });
+                    if light.blend.supports_invert() {
+                        self.dirty |= ui
+                            .checkbox(&mut light.invert, "Invert")
+                            .on_hover_text("With Add, subtract brightness to make a Dark Light")
+                            .changed();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    self.dirty |= ui.color_edit_button_rgb(&mut light.color).changed();
+                });
+                self.dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut light.intensity, 0.0..=10000.0)
+                            .logarithmic(true)
+                            .text("Intensity"),
+                    )
+                    .changed();
+                self.dirty |= ui
+                    .add(egui::Slider::new(&mut light.width_degrees, 1.0..=180.0).text("Width (°)"))
+                    .changed();
+                self.dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut light.height_degrees, 1.0..=90.0).text("Height (°)"),
+                    )
+                    .changed();
+                let directional = light.shape == LightShape::Gradient;
+                let box_gradient = light.shape == LightShape::Rectangle;
+                egui::CollapsingHeader::new(if directional {
+                    "Gradient curve"
+                } else if box_gradient {
+                    "Box Gradient"
+                } else {
+                    "Falloff curve"
+                })
+                .id_salt("light-curve")
                 .default_open(true)
                 .show(ui, |ui| {
-                    self.dirty |= mapping_hotspot_cut_controls(ui, light);
+                    if box_gradient {
+                        self.dirty |= ui
+                            .checkbox(&mut light.box_link_axes, "Link horizontal and vertical")
+                            .changed();
+                        if !light.box_link_axes {
+                            light
+                                .box_vertical
+                                .get_or_insert_with(|| light.falloff.clone());
+                            ui.label("Horizontal curve");
+                        }
+                    }
+                    let curve = if directional {
+                        &mut light.gradient_curve
+                    } else {
+                        &mut light.falloff
+                    };
+                    ui.push_id("main-ramp", |ui| {
+                        self.dirty |= falloff_controls(ui, curve, directional, box_gradient);
+                    });
+                    if box_gradient
+                        && !light.box_link_axes
+                        && let Some(vertical) = &mut light.box_vertical
+                    {
+                        egui::CollapsingHeader::new("Vertical curve")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.dirty |= falloff_controls(ui, vertical, false, true);
+                            });
+                    }
                 });
-            let mut longitude = (light.u - 0.5) * 360.0;
-            let mut latitude = 90.0 - light.v * 180.0;
-            if ui
-                .add(egui::Slider::new(&mut longitude, -180.0..=180.0).text("Longitude (°)"))
-                .changed()
-            {
-                light.u = (longitude / 360.0 + 0.5).rem_euclid(1.0);
-                self.dirty = true;
+                egui::CollapsingHeader::new("Mapping, hotspot & cut")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        self.dirty |= mapping_hotspot_cut_controls(ui, light);
+                    });
+                let mut longitude = (light.u - 0.5) * 360.0;
+                let mut latitude = 90.0 - light.v * 180.0;
+                if ui
+                    .add(egui::Slider::new(&mut longitude, -180.0..=180.0).text("Longitude (°)"))
+                    .changed()
+                {
+                    light.u = (longitude / 360.0 + 0.5).rem_euclid(1.0);
+                    self.dirty = true;
+                }
+                if ui
+                    .add(egui::Slider::new(&mut latitude, -90.0..=90.0).text("Latitude (°)"))
+                    .changed()
+                {
+                    light.v = (90.0 - latitude) / 180.0;
+                    self.dirty = true;
+                }
             }
-            if ui
-                .add(egui::Slider::new(&mut latitude, -90.0..=90.0).text("Latitude (°)"))
-                .changed()
-            {
-                light.v = (90.0 - latitude) / 180.0;
-                self.dirty = true;
-            }
+        }
+        if let Some((path, id)) = image_import {
+            self.import_image(path, id, ui.ctx());
         }
         ui.separator();
         egui::ComboBox::from_id_salt("hdr-output-size")
@@ -783,7 +962,7 @@ impl Editor {
             });
         if ui
             .add_enabled(
-                self.export.is_none() && !self.importing,
+                self.export.is_none() && self.importing.is_none(),
                 egui::Button::new("Export HDR…"),
             )
             .clicked()
@@ -838,6 +1017,7 @@ impl Editor {
                     );
                     match self.canvas_view {
                         CanvasView::Hdr => {
+                            ui.checkbox(&mut self.show_lat_long_guide, "Lat-Long Guide");
                             ui.small("Double-click to add · drag a light to move");
                         }
                         CanvasView::Falloff => {
@@ -859,11 +1039,9 @@ impl Editor {
                         .as_ref()
                         .filter(|(index, _)| {
                             Some(*index) == self.selected
-                                && self
-                                    .document
-                                    .lights
-                                    .get(*index)
-                                    .is_some_and(|light| light.enabled)
+                                && self.document.lights.get(*index).is_some_and(|light| {
+                                    light.enabled && light.shape != LightShape::Image
+                                })
                         })
                         .map(|(_, texture)| texture),
                 };
@@ -884,7 +1062,15 @@ impl Editor {
                     egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
                     egui::StrokeKind::Inside,
                 );
-                if !editing_hdr && self.selected.is_none() {
+                if editing_hdr && self.show_lat_long_guide {
+                    draw_lat_long_guide(&painter, rect);
+                }
+                if !editing_hdr
+                    && self
+                        .selected
+                        .and_then(|index| self.document.lights.get(index))
+                        .is_none_or(|light| light.shape == LightShape::Image)
+                {
                     painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -919,11 +1105,9 @@ impl Editor {
                     && self.document.lights.len() < 32
                     && let Some(uv) = pointer
                 {
-                    let i = self.document.add_light();
+                    let i = self.add_light();
                     self.document.lights[i].u = (uv.x - rotation).rem_euclid(1.0);
                     self.document.lights[i].v = uv.y.clamp(0.005, 0.995);
-                    self.selected = Some(i);
-                    self.dirty = true;
                 } else if (response.clicked() || drag_started)
                     && let Some(uv) = hit_pointer
                 {
@@ -971,7 +1155,7 @@ impl Editor {
                     return;
                 }
                 for (i, light) in self.document.lights.iter().enumerate() {
-                    if !light.enabled {
+                    if !light.enabled || light.shape == LightShape::Image {
                         continue;
                     }
                     let selected = self.selected == Some(i);
@@ -985,13 +1169,9 @@ impl Editor {
                 }
             });
     }
-    pub fn refresh(
-        &mut self,
-        ctx: &egui::Context,
-        gl: &glow::Context,
-        renderer: &Arc<Mutex<Renderer>>,
-    ) {
+    pub fn refresh(&mut self, ctx: &egui::Context) -> Option<Arc<HdrImage>> {
         let size = [PREVIEW_WIDTH as usize, PREVIEW_HEIGHT as usize];
+        let mut completed = None;
         if let Some(image) = self
             .preview_job
             .as_ref()
@@ -1003,7 +1183,6 @@ impl Editor {
         {
             self.preview_job = None;
             if let Some(image) = image {
-                renderer.lock().unwrap().upload_environment(gl, &image);
                 let color = egui::ColorImage::new(size, image.display_pixels());
                 if let Some(texture) = &mut self.texture {
                     texture.set(color, egui::TextureOptions::LINEAR);
@@ -1011,6 +1190,7 @@ impl Editor {
                     self.texture =
                         Some(ctx.load_texture("HDR canvas", color, egui::TextureOptions::LINEAR));
                 }
+                completed = Some(Arc::new(image));
                 ctx.request_repaint();
             }
         }
@@ -1052,5 +1232,47 @@ impl Editor {
             self.falloff_stale = false;
             ctx.request_repaint();
         }
+        completed
+    }
+}
+
+fn preview_quality_options(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u32,
+    options: &[u32],
+    minimum: u32,
+    suffix: &str,
+) {
+    egui::ComboBox::from_label(label)
+        .selected_text(format!("{value}{suffix}"))
+        .show_ui(ui, |ui| {
+            for &option in options.iter().filter(|&&option| option >= minimum) {
+                ui.selectable_value(value, option, format!("{option}{suffix}"));
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_light_layers_are_soft_round_lights_and_disable_default_lighting() {
+        let mut editor = Editor::default();
+        assert!(!editor.lighting.default_light);
+        editor.lighting.default_light = true;
+
+        assert_eq!(editor.place_light(glam::Vec3::X, false), Some("Round 1"));
+        let light = &editor.document.lights[0];
+        assert!(matches!(light.shape, LightShape::Round));
+        assert!(matches!(light.falloff.preset, Some(FalloffPreset::Smooth)));
+        assert!(!editor.lighting.default_light);
+
+        editor.lighting.default_light = true;
+        assert_eq!(editor.place_light(glam::Vec3::Z, false), Some("Round 1"));
+        assert!(editor.lighting.default_light);
+        assert_eq!(editor.place_light(glam::Vec3::Z, true), Some("Round 2"));
+        assert!(!editor.lighting.default_light);
     }
 }

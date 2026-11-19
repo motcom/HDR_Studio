@@ -9,6 +9,12 @@ use std::{
 
 pub const PREVIEW_WIDTH: u32 = 512;
 pub const PREVIEW_HEIGHT: u32 = 256;
+pub const SHADOW_SAMPLE_COUNT: usize = 64;
+
+pub struct ShadowSamples {
+    pub directions: [[f32; 3]; SHADOW_SAMPLE_COUNT],
+    pub weights: [[f32; 3]; SHADOW_SAMPLE_COUNT],
+}
 
 #[derive(Clone, Debug)]
 pub struct HdrImage {
@@ -57,6 +63,10 @@ impl HdrImage {
     }
 
     pub fn sample(&self, u: f32, v: f32) -> Vec3 {
+        self.sample_color(u, v, true)
+    }
+
+    fn sample_color(&self, u: f32, v: f32, linear: bool) -> Vec3 {
         let x = u.rem_euclid(1.0) * self.width as f32 - 0.5;
         let y = (v * self.height as f32 - 0.5).clamp(0.0, self.height as f32 - 1.0);
         let x0 = x.floor() as i32;
@@ -64,9 +74,19 @@ impl HdrImage {
         let tx = x - x.floor();
         let ty = y - y.floor();
         let pixel = |x: i32, y: u32| {
-            Vec3::from_array(
-                self.pixels[(y * self.width + x.rem_euclid(self.width as i32) as u32) as usize],
-            )
+            let rgb =
+                self.pixels[(y * self.width + x.rem_euclid(self.width as i32) as u32) as usize];
+            Vec3::from_array(if linear {
+                rgb
+            } else {
+                rgb.map(|v| {
+                    if v <= 0.04045 {
+                        v / 12.92
+                    } else {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    }
+                })
+            })
         };
         pixel(x0, y0).lerp(pixel(x0 + 1, y0), tx).lerp(
             pixel(x0, (y0 + 1).min(self.height - 1))
@@ -144,6 +164,54 @@ impl HdrImage {
             .to_array()
         })
     }
+
+    pub fn shadow_samples(&self) -> Option<ShadowSamples> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let mut rows = Vec::with_capacity(height);
+        let mut columns = Vec::with_capacity(self.pixels.len());
+        let mut sum = 0.0_f64;
+        let luma = Vec3::new(0.2126, 0.7152, 0.0722);
+        for (y, row) in self.pixels.chunks_exact(width).enumerate() {
+            let solid_angle = ((y as f64 + 0.5) * std::f64::consts::PI / height as f64).sin();
+            for &pixel in row {
+                sum += f64::from(Vec3::from_array(pixel).dot(luma)) * solid_angle;
+                columns.push(sum);
+            }
+            rows.push(sum);
+        }
+        if sum <= 0.0 {
+            return None;
+        }
+
+        // Importance sample the rows and columns independently. Weight each
+        // selected color by the inverse of the luminance used to select it.
+        let mut samples = ShadowSamples {
+            directions: [[0.0; 3]; SHADOW_SAMPLE_COUNT],
+            weights: [[0.0; 3]; SHADOW_SAMPLE_COUNT],
+        };
+        for i in 0..SHADOW_SAMPLE_COUNT {
+            let row_target = (i as f64 + 0.5) / SHADOW_SAMPLE_COUNT as f64 * sum;
+            let y = rows.partition_point(|&bound| bound <= row_target);
+            let start = if y == 0 { 0.0 } else { rows[y - 1] };
+            let fraction = f64::from((i as u32).reverse_bits()) / (1u64 << 32) as f64
+                + 0.5 / SHADOW_SAMPLE_COUNT as f64;
+            let column_target = start + fraction * (rows[y] - start);
+            let row = &columns[y * width..][..width];
+            let x = row
+                .partition_point(|&bound| bound <= column_target)
+                .min(width - 1);
+            let rgb = Vec3::from_array(self.pixels[y * width + x]);
+            samples.directions[i] = panorama_direction(
+                (x as f32 + 0.5) / self.width as f32,
+                (y as f32 + 0.5) / self.height as f32,
+            )
+            .to_array();
+            samples.weights[i] =
+                (rgb / Vec3::splat(rgb.dot(luma).max(f32::MIN_POSITIVE))).to_array();
+        }
+        Some(samples)
+    }
 }
 
 pub fn sh_basis(n: Vec3) -> [f32; 9] {
@@ -165,17 +233,31 @@ pub enum BlendMode {
     Add,
     Multiply,
     Amplify,
+    Over,
+    LowPass,
 }
 
 impl BlendMode {
-    pub const ALL: [Self; 3] = [Self::Add, Self::Multiply, Self::Amplify];
+    pub const ALL: [Self; 5] = [
+        Self::Add,
+        Self::Multiply,
+        Self::Amplify,
+        Self::Over,
+        Self::LowPass,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Add => "Add",
             Self::Multiply => "Multiply",
             Self::Amplify => "Amplify",
+            Self::Over => "Over",
+            Self::LowPass => "Low Pass",
         }
+    }
+
+    pub fn supports_invert(self) -> bool {
+        matches!(self, Self::Add | Self::Amplify | Self::LowPass)
     }
 }
 
@@ -184,6 +266,7 @@ pub enum LightShape {
     Rectangle,
     Round,
     Gradient,
+    Image,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,7 +498,31 @@ impl FalloffTable {
 }
 
 #[derive(Clone)]
+pub struct ImageLayer {
+    pub image: Option<Arc<HdrImage>>,
+    pub source: String,
+    pub rotation: f32,
+    pub exposure: f32,
+    pub alpha: f32,
+    pub linear: bool,
+}
+
+impl Default for ImageLayer {
+    fn default() -> Self {
+        Self {
+            image: None,
+            source: String::new(),
+            rotation: 0.0,
+            exposure: 0.0,
+            alpha: 1.0,
+            linear: true,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Light {
+    pub id: u32,
     pub name: String,
     pub enabled: bool,
     pub u: f32,
@@ -430,7 +537,9 @@ pub struct Light {
     pub intensity: f32,
     pub color: [f32; 3],
     pub blend: BlendMode,
+    pub invert: bool,
     pub shape: LightShape,
+    pub image_layer: ImageLayer,
     pub mapping: LightMapping,
     pub core: [f32; 2],
     pub cut_enabled: bool,
@@ -480,6 +589,7 @@ impl Light {
         let extent = match self.shape {
             LightShape::Rectangle | LightShape::Gradient => normal.abs().element_sum(),
             LightShape::Round => 1.0,
+            LightShape::Image => return None,
         };
         Some((normal, extent * (1.0 - 2.0 * self.cut_amount)))
     }
@@ -510,12 +620,14 @@ impl Light {
         let inside = match self.shape {
             LightShape::Rectangle | LightShape::Gradient => p.abs().max_element() < 1.0,
             LightShape::Round => p.length_squared() < 1.0,
+            LightShape::Image => false,
         };
         inside && cut.is_none_or(|(normal, distance)| normal.dot(p) <= distance)
     }
 
     pub fn hit(&self, u: f32, v: f32) -> bool {
         self.enabled
+            && self.shape != LightShape::Image
             && self
                 .projection()
                 .local(glam::Vec2::new(u, v), panorama_direction(u, v))
@@ -538,6 +650,7 @@ impl Light {
                 falloff.sample((b + (b * b + a * c).sqrt()) / c)
             }
             LightShape::Gradient => falloff.sample(0.5 + p.dot(falloff.gradient_axis)),
+            LightShape::Image => 0.0,
         }
     }
 
@@ -549,7 +662,7 @@ impl Light {
                 falloff.gradient_axis = axis * (0.5 / axis.abs().element_sum());
                 falloff
             }
-            LightShape::Round => self.falloff.bake(false),
+            LightShape::Round | LightShape::Image => self.falloff.bake(false),
             LightShape::Rectangle => {
                 let mut falloff = self.falloff.bake(true);
                 if !self.box_link_axes
@@ -563,19 +676,63 @@ impl Light {
     }
 
     fn blend_at(&self, underneath: Vec3, position: glam::Vec2, falloff: &FalloffTable) -> Vec3 {
-        let light = Vec3::from_array(self.color) * self.intensity * self.profile(position, falloff);
+        let color = Vec3::from_array(self.color) * self.intensity;
+        let profile = self.profile(position, falloff);
+        let light = color * profile;
         match self.blend {
+            BlendMode::Add if self.invert => {
+                let value = (underneath.max_element() - light.max_element()).max(0.0);
+                with_value(underneath, value)
+            }
             BlendMode::Add => underneath + light,
             BlendMode::Multiply => underneath * light,
+            BlendMode::Amplify if self.invert => underneath / (Vec3::ONE + light),
             BlendMode::Amplify => underneath * (Vec3::ONE + light),
+            BlendMode::Over => underneath.lerp(color, profile),
+            BlendMode::LowPass => {
+                let base_value = underneath.max_element();
+                let limit = color.max_element();
+                let target = if self.invert {
+                    base_value.max(limit)
+                } else {
+                    base_value.min(limit)
+                };
+                underneath.lerp(with_value(underneath, target), profile)
+            }
         }
     }
 }
 
+// Scale RGB to the new HSV value while preserving the underlying hue and saturation.
+fn with_value(rgb: Vec3, value: f32) -> Vec3 {
+    let original = rgb.max_element();
+    if value == original {
+        rgb
+    } else if original > 0.0 {
+        (rgb / Vec3::splat(original)) * value
+    } else {
+        Vec3::splat(value)
+    }
+}
+
+enum ComposedLayer<'a> {
+    Image {
+        source: &'a HdrImage,
+        rotation: f32,
+        gain: f32,
+        alpha: f32,
+        linear: bool,
+    },
+    Light {
+        light: &'a Light,
+        projection: Projection,
+        cut: Option<(glam::Vec2, f32)>,
+        falloff: Box<FalloffTable>,
+    },
+}
+
 #[derive(Clone)]
 pub struct Document {
-    pub base: Option<Arc<HdrImage>>,
-    pub source: String,
     pub exposure: f32,
     pub rotation: f32,
     pub lights: Vec<Light>,
@@ -584,8 +741,6 @@ pub struct Document {
 impl Default for Document {
     fn default() -> Self {
         Self {
-            base: None,
-            source: "Black environment".into(),
             exposure: 0.0,
             rotation: 0.0,
             lights: vec![],
@@ -603,7 +758,7 @@ impl Document {
         let mut light = self
             .lights
             .get(index)
-            .filter(|light| light.enabled)?
+            .filter(|light| light.enabled && light.shape != LightShape::Image)?
             .clone();
         let falloff = light.bake_falloff();
         let white_level = if light.shape == LightShape::Gradient {
@@ -612,6 +767,7 @@ impl Document {
             light.profile(glam::Vec2::from_array(light.core), &falloff)
         };
         light.blend = BlendMode::Add;
+        light.invert = false;
         light.color = [1.0; 3];
         light.intensity = 1.0;
         let isolated = Self {
@@ -649,7 +805,8 @@ impl Document {
         let id = self.next_id;
         self.next_id += 1;
         self.lights.push(Light {
-            name: format!("Softbox {id}"),
+            id,
+            name: format!("Round {id}"),
             enabled: true,
             u: 0.75,
             v: 0.45,
@@ -663,7 +820,9 @@ impl Document {
             intensity: 10.0,
             color: [1.0; 3],
             blend: BlendMode::Add,
-            shape: LightShape::Rectangle,
+            invert: false,
+            shape: LightShape::Round,
+            image_layer: ImageLayer::default(),
             mapping: LightMapping::Spherical,
             core: [0.0; 2],
             cut_enabled: false,
@@ -678,18 +837,36 @@ impl Document {
             .lights
             .iter()
             .filter(|light| light.enabled)
-            .map(|light| {
-                (
-                    light,
-                    light.projection(),
-                    light.cut_plane(),
-                    light.bake_falloff(),
-                )
+            .filter_map(|light| {
+                if light.shape == LightShape::Image {
+                    let layer = &light.image_layer;
+                    let source = layer.image.as_deref().filter(|_| layer.alpha > 0.0)?;
+                    Some(ComposedLayer::Image {
+                        source,
+                        rotation: layer.rotation / 360.0,
+                        gain: 2.0_f32.powf(layer.exposure),
+                        alpha: layer.alpha,
+                        linear: layer.linear,
+                    })
+                } else {
+                    Some(ComposedLayer::Light {
+                        light,
+                        projection: light.projection(),
+                        cut: light.cut_plane(),
+                        falloff: Box::new(light.bake_falloff()),
+                    })
+                }
             })
             .collect();
-        let spherical = layers
-            .iter()
-            .any(|(_, projection, _, _)| matches!(projection, Projection::Spherical { .. }));
+        let spherical = layers.iter().any(|layer| {
+            matches!(
+                layer,
+                ComposedLayer::Light {
+                    projection: Projection::Spherical { .. },
+                    ..
+                }
+            )
+        });
         let columns: Vec<_> = (0..width)
             .map(|x| {
                 let u = ((x as f32 + 0.5) / width as f32 - self.rotation / 360.0).rem_euclid(1.0);
@@ -712,18 +889,38 @@ impl Document {
             for &(u, sin_lon, cos_lon) in &columns {
                 let uv = glam::Vec2::new(u, v);
                 let direction = Vec3::new(cos_lon * cos_lat, sin_lat, sin_lon * cos_lat);
-                let mut rgb = self
-                    .base
-                    .as_ref()
-                    .map_or(Vec3::ZERO, |base| base.sample(u, v));
-                for (light, projection, cut, falloff) in &layers {
-                    if let Some(position) = projection.local(uv, direction)
-                        && light.covers(position, *cut)
-                    {
-                        // Keep stacked gains within representable RGBE range.
-                        rgb = light
-                            .blend_at(rgb, position, falloff)
-                            .min(Vec3::splat(1.0e30));
+                let mut rgb = Vec3::ZERO;
+                for layer in &layers {
+                    match layer {
+                        ComposedLayer::Image {
+                            source,
+                            rotation,
+                            gain,
+                            alpha,
+                            linear,
+                        } => {
+                            let color = if *linear {
+                                source.sample(u - rotation, v)
+                            } else {
+                                source.sample_color(u - rotation, v, false)
+                            };
+                            rgb = rgb.lerp(color * *gain, *alpha).min(Vec3::splat(1.0e30));
+                        }
+                        ComposedLayer::Light {
+                            light,
+                            projection,
+                            cut,
+                            falloff,
+                        } => {
+                            if let Some(position) = projection.local(uv, direction)
+                                && light.covers(position, *cut)
+                            {
+                                // Keep stacked gains within representable RGBE range.
+                                rgb = light
+                                    .blend_at(rgb, position, falloff)
+                                    .min(Vec3::splat(1.0e30));
+                            }
+                        }
                     }
                 }
                 pixels.push((rgb * gain).to_array());
@@ -742,10 +939,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_layers_rotate_and_composite_with_independent_color_settings() {
+        let mut doc = Document::default();
+        let lower = doc.add_light();
+        let upper = doc.add_light();
+        for index in [lower, upper] {
+            doc.lights[index].shape = LightShape::Image;
+        }
+        doc.lights[lower].image_layer.image = Some(Arc::new(HdrImage {
+            width: 4,
+            height: 2,
+            pixels: vec![[1.0; 3]; 8],
+        }));
+        let image = &mut doc.lights[upper].image_layer;
+        assert!(image.linear);
+        image.image = Some(Arc::new(HdrImage {
+            width: 4,
+            height: 2,
+            pixels: [[0.5; 3], [0.0; 3], [2.0; 3], [0.0; 3]].repeat(2),
+        }));
+        image.rotation = 180.0;
+        image.exposure = 1.0;
+        image.alpha = 0.5;
+        assert_eq!(doc.compose(4, 2).pixels[0], [2.5; 3]);
+        assert_eq!(doc.compose(4, 2).pixels[2], [1.0; 3]);
+
+        doc.lights[upper].image_layer.linear = false;
+        assert!((doc.compose(4, 2).pixels[2][0] - 0.714_041).abs() < 1e-6);
+        doc.lights.swap(lower, upper);
+        assert_eq!(doc.compose(4, 2).pixels, vec![[1.0; 3]; 8]);
+    }
+
+    #[test]
     fn rectangular_falloff_keeps_straight_edges_without_a_diagonal_ridge() {
         let mut doc = Document::default();
         let index = doc.add_light();
         let light = &mut doc.lights[index];
+        light.shape = LightShape::Rectangle;
         light.falloff = FalloffCurve::from_preset(FalloffPreset::Linear);
         light.falloff.box_interpolation = BoxInterpolation::Smooth;
         light.core = [0.2, -0.4];
@@ -774,6 +1004,7 @@ mod tests {
         let mut doc = Document::default();
         let index = doc.add_light();
         let light = &mut doc.lights[index];
+        light.shape = LightShape::Rectangle;
         light.falloff = FalloffCurve::from_preset(FalloffPreset::Linear);
         light.box_vertical = Some(FalloffCurve::from_preset(FalloffPreset::HardEdge));
         let point = glam::Vec2::splat(0.5);
@@ -790,6 +1021,7 @@ mod tests {
         let mut doc = Document::default();
         let index = doc.add_light();
         let light = &mut doc.lights[index];
+        light.shape = LightShape::Rectangle;
         light.falloff = FalloffCurve::from_preset(FalloffPreset::Linear);
         for [distance, expected] in [[0.25, 0.75], [0.5, 0.5], [0.75, 0.25]] {
             assert!((light.falloff.sample(distance, true) - expected).abs() < 1e-6);
@@ -805,6 +1037,7 @@ mod tests {
         let mut doc = Document::default();
         let index = doc.add_light();
         let light = &mut doc.lights[index];
+        light.shape = LightShape::Rectangle;
         for (preset, anchor) in [
             (FalloffPreset::Softbox, 0.875),
             (FalloffPreset::Smooth, 0.25),
@@ -949,6 +1182,74 @@ mod tests {
     }
 
     #[test]
+    fn over_low_pass_and_invert_apply_the_light_profile_to_hdr_layers() {
+        let background = [4.0, 8.0, 2.0];
+        let mut doc = Document::default();
+        let base = doc.add_light();
+        doc.lights[base].shape = LightShape::Image;
+        doc.lights[base].image_layer.image = Some(Arc::new(HdrImage {
+            width: 2,
+            height: 1,
+            pixels: vec![background; 2],
+        }));
+        let index = doc.add_light();
+        let light = &mut doc.lights[index];
+        light.u = 0.5;
+        light.v = 0.5;
+        light.width_degrees = 160.0;
+        light.shape = LightShape::Round;
+        light.mapping = LightMapping::Flat;
+        light.falloff = FalloffCurve::from_preset(FalloffPreset::Linear);
+        light.color = [0.5, 0.25, 1.0];
+        let preview = doc.falloff_preview(index, 9, 5);
+
+        for (mode, invert, intensity, center, halfway) in [
+            (
+                BlendMode::Over,
+                false,
+                4.0,
+                [2.0, 1.0, 4.0],
+                [3.0, 4.5, 3.0],
+            ),
+            (
+                BlendMode::LowPass,
+                false,
+                4.0,
+                [2.0, 4.0, 1.0],
+                [3.0, 6.0, 1.5],
+            ),
+            (
+                BlendMode::LowPass,
+                true,
+                12.0,
+                [6.0, 12.0, 3.0],
+                [5.0, 10.0, 2.5],
+            ),
+            (BlendMode::Add, true, 4.0, [2.0, 4.0, 1.0], [3.0, 6.0, 1.5]),
+            (BlendMode::Add, true, 12.0, [0.0; 3], [1.0, 2.0, 0.5]),
+            (
+                BlendMode::Amplify,
+                true,
+                4.0,
+                [4.0 / 3.0, 4.0, 0.4],
+                [2.0, 8.0 / 1.5, 2.0 / 3.0],
+            ),
+        ] {
+            let light = &mut doc.lights[index];
+            light.blend = mode;
+            light.invert = invert;
+            light.intensity = intensity;
+            let image = doc.compose(9, 5);
+            assert_eq!(image.pixels[18], background);
+            assert!(Vec3::from_array(image.pixels[22]).abs_diff_eq(Vec3::from_array(center), 1e-5));
+            assert!(
+                Vec3::from_array(image.pixels[21]).abs_diff_eq(Vec3::from_array(halfway), 1e-5)
+            );
+            assert_eq!(doc.falloff_preview(index, 9, 5), preview);
+        }
+    }
+
+    #[test]
     fn round_hotspot_shifts_inside_outline_and_hard_cut_masks_at_threshold() {
         let mut doc = Document::default();
         let index = doc.add_light();
@@ -999,6 +1300,7 @@ mod tests {
         let mut doc = Document::default();
         let i = doc.add_light();
         let light = &mut doc.lights[i];
+        light.shape = LightShape::Rectangle;
         light.u = 0.99;
         light.v = 0.5;
         light.width_degrees = 45.0;
@@ -1035,6 +1337,37 @@ mod tests {
                 .zip(sh_basis(n))
                 .fold(Vec3::ZERO, |c, (a, b)| c + Vec3::from_array(a) * b);
             assert!((evaluated - Vec3::new(2., 3., 4.)).abs().max_element() < 0.005);
+        }
+    }
+
+    #[test]
+    fn shadow_samples_follow_hdr_radiance_and_solid_angle() {
+        let mut image = HdrImage {
+            width: 16,
+            height: 8,
+            pixels: vec![[0.0; 3]; 128],
+        };
+        assert!(image.shadow_samples().is_none());
+
+        image.pixels[3] = [10.0; 3];
+        image.pixels[3 * 16 + 11] = [10.0; 3];
+        let samples = image.shadow_samples().unwrap();
+        let polar = panorama_direction(3.5 / 16.0, 0.5 / 8.0).to_array();
+        let equatorial = panorama_direction(11.5 / 16.0, 3.5 / 8.0).to_array();
+        let polar_count = samples
+            .directions
+            .iter()
+            .filter(|&&ray| ray == polar)
+            .count();
+        let equatorial_count = samples
+            .directions
+            .iter()
+            .filter(|&&ray| ray == equatorial)
+            .count();
+        assert_eq!(polar_count + equatorial_count, SHADOW_SAMPLE_COUNT);
+        assert!((10..=11).contains(&polar_count));
+        for weight in samples.weights {
+            assert!(Vec3::from_array(weight).abs_diff_eq(Vec3::ONE, 1e-6));
         }
     }
     #[test]
