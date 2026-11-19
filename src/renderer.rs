@@ -43,7 +43,7 @@ pub struct Lighting {
 impl Default for Lighting {
     fn default() -> Self {
         Self {
-            default_light: false,
+            default_light: true,
             environment: true,
             background: true,
             roughness: 0.25,
@@ -202,11 +202,12 @@ impl Renderer {
         gl: &glow::Context,
         mesh: &PickMesh,
         vertices: &[Vertex],
+        running: &impl Fn() -> bool,
     ) -> Option<&str> {
         let count = mesh.ray_texel_count();
         if count > 0 && self.ray_mesh.is_none() && self.ray_mesh_error.is_none() {
-            match self.upload_ray_mesh(gl, mesh, vertices, count) {
-                Ok(data) => self.ray_mesh = Some(data),
+            match self.upload_ray_mesh(gl, mesh, vertices, count, running) {
+                Ok(data) => self.ray_mesh = data,
                 Err(error) => self.ray_mesh_error = Some(error),
             }
         }
@@ -219,7 +220,8 @@ impl Renderer {
         mesh: &PickMesh,
         vertices: &[Vertex],
         count: usize,
-    ) -> Result<(glow::Texture, i32), String> {
+        running: &impl Fn() -> bool,
+    ) -> Result<Option<(glow::Texture, i32)>, String> {
         let max_size = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) }.max(1) as usize;
         let max_layers =
             unsafe { gl.get_parameter_i32(glow::MAX_ARRAY_TEXTURE_LAYERS) }.max(0) as usize;
@@ -233,7 +235,12 @@ impl Renderer {
             .try_reserve_exact(texel_capacity)
             .map_err(|_| "Could not allocate ray tracing data")?;
         texels.resize(texel_capacity, [0_u32; 4]);
-        let nodes = mesh.write_ray_texels(vertices, &mut texels[..count]);
+        let Some(nodes) = mesh.write_ray_texels(vertices, &mut texels[..count], running) else {
+            return Ok(None);
+        };
+        if !running() {
+            return Ok(None);
+        }
         unsafe {
             // Ignore errors left by earlier draws when checking this allocation.
             for _ in 0..16 {
@@ -268,12 +275,25 @@ impl Renderer {
                     (texels.len() * size_of::<[u32; 4]>()).div_ceil(1024 * 1024)
                 ));
             }
-            Ok((texture, nodes))
+            Ok(Some((texture, nodes)))
         }
     }
-    pub fn upload_environment(&mut self, gl: &glow::Context, image: &HdrImage) {
-        self.diffuse_sh = image.diffuse_sh();
-        self.shadow_samples = image.shadow_samples();
+    pub fn upload_environment(
+        &mut self,
+        gl: &glow::Context,
+        image: &HdrImage,
+        running: &impl Fn() -> bool,
+    ) -> bool {
+        let diffuse_sh = image.diffuse_sh();
+        if !running() {
+            return false;
+        }
+        let shadow_samples = image.shadow_samples();
+        if !running() {
+            return false;
+        }
+        self.diffuse_sh = diffuse_sh;
+        self.shadow_samples = shadow_samples;
         self.max_lod = (image.width.max(image.height) as f32).log2().floor();
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.environment));
@@ -291,6 +311,7 @@ impl Renderer {
             gl.generate_mipmap(glow::TEXTURE_2D);
             gl.bind_texture(glow::TEXTURE_2D, None);
         }
+        true
     }
 
     fn bind_ray_uniforms(

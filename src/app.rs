@@ -29,6 +29,7 @@ struct LightStroke {
 
 pub struct App {
     preview: Preview,
+    show_preview: bool,
     environment: Option<Arc<HdrImage>>,
     scene: Option<Arc<Scene>>,
     loading: Option<mpsc::Receiver<LoadResult>>,
@@ -51,9 +52,11 @@ impl App {
         let mut editor = Editor::default();
         if let Some(settings) = &settings {
             editor.lighting = settings.lighting();
+            editor.lighting.default_light = true;
         }
         Ok(Self {
             preview: Preview::new(&cc.egui_ctx)?,
+            show_preview: true,
             environment: None,
             scene: None,
             loading: None,
@@ -126,6 +129,7 @@ impl App {
         }
         if let Some(stroke) = &mut self.light_stroke
             && let Some(scene) = &self.scene
+            && let Some(pick_mesh) = scene.pick_mesh.get()
         {
             let positions = ui.input(|i| {
                 let mut positions = Vec::new();
@@ -163,7 +167,7 @@ impl App {
                             (1.0 - 2.0 * (pointer.y - rect.top()) / rect.height()) as f64,
                         );
                         self.light_paint
-                            .direction(camera, ndc, &scene.pick_mesh, &scene.vertices)
+                            .direction(camera, ndc, pick_mesh, &scene.vertices)
                     });
                 self.placement_status = match direction {
                     Some(direction) => {
@@ -235,8 +239,11 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (before, restored) = self.editor.begin_edit_frame(ctx);
+        if restored {
+            self.light_stroke = None;
+        }
         self.editor.poll();
-        self.preview.poll(ctx);
         if let Some(path) = self.initial.take() {
             if is_hdr(&path) {
                 self.editor.import(path, ctx);
@@ -294,12 +301,25 @@ impl eframe::App for App {
                     egui::DragValue::new(&mut self.seconds).speed(0.01),
                 );
                 ui.label("applied on Open / Reload");
+                ui.separator();
+                if ui.checkbox(&mut self.show_preview, "3D Preview").changed() {
+                    self.editor.set_preview_visible(self.show_preview);
+                    if !self.show_preview {
+                        self.preview.suspend();
+                        self.environment = None;
+                        self.light_stroke = None;
+                        self.placement_status.clear();
+                    }
+                }
                 if self.loading.is_some() {
                     ui.spinner();
                     ui.label("Loading…");
                 }
             });
         });
+        if self.show_preview {
+            self.preview.poll(ctx);
+        }
         egui::SidePanel::right("inspector")
             .default_width(320.0)
             .resizable(true)
@@ -314,8 +334,14 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
+                let scroll_source = if self.inspector_tab == InspectorTab::HdrEnvironment {
+                    egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                } else {
+                    egui::scroll_area::ScrollSource::ALL
+                };
                 egui::ScrollArea::vertical()
                     .id_salt(egui::Id::new("inspector-scroll").with(self.inspector_tab as u8))
+                    .scroll_source(scroll_source)
                     .show(ui, |ui| match self.inspector_tab {
                         InspectorTab::Lighting => {
                             self.editor.lighting_controls(ui);
@@ -328,17 +354,21 @@ impl eframe::App for App {
                     });
             });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            if let Some(error) = self.error.as_ref().or(self.preview.warning.as_ref())
+            let preview_warning = self.preview.warning.as_ref().filter(|_| self.show_preview);
+            if let Some(error) = self.error.as_ref().or(preview_warning)
                 .or(self.settings.as_ref().and_then(|settings| settings.error.as_ref())) {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
-            } else {
+            } else if self.show_preview {
                 ui.label(
                     "Camera locked · HDR preview uses approximate environment shading · export is linear HDR",
                 );
+            } else {
+                ui.label("Export is linear HDR");
             }
         });
-        self.editor.canvas(ctx);
-        egui::CentralPanel::default()
+        self.editor.canvas(ctx, !self.show_preview);
+        if self.show_preview {
+            egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(14, 17, 22)))
             .show(ctx, |ui| {
                 let camera: Option<Camera> = self
@@ -390,14 +420,17 @@ impl eframe::App for App {
                     }
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_rgb(35, 40, 49));
-                    self.preview.show(ui, rect, Request {
-                        scene,
-                        camera: self.camera,
-                        environment: self.environment.clone(),
-                        lighting: self.editor.lighting,
-                        size: [0; 2],
-                        refinement: 0,
-                    });
+                    if let Some(environment) = self.environment.clone() {
+                        self.preview.show(ui, rect, Request {
+                            scene,
+                            camera: self.camera,
+                            environment: Some(environment),
+                            lighting: self.editor.lighting,
+                            needs_pick_mesh: self.light_paint != LightPaint::Off,
+                            size: [0; 2],
+                            refinement: 0,
+                        });
+                    }
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
@@ -411,6 +444,7 @@ impl eframe::App for App {
                     });
                 }
             });
+        }
         if self.loading.is_none()
             && let Some(path) =
                 ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
@@ -424,6 +458,7 @@ impl eframe::App for App {
                 self.open(path, ctx);
             }
         }
+        self.editor.finish_edit_frame(ctx, before);
         if let Some(image) = self.editor.refresh(ctx) {
             self.environment = Some(image);
         }

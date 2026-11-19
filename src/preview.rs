@@ -1,5 +1,6 @@
 use crate::{
     environment::HdrImage,
+    light_paint::PickMesh,
     renderer::{Lighting, Renderer},
     scene::Scene,
 };
@@ -19,7 +20,10 @@ use raw_window_handle::{
 };
 use std::{
     num::{NonZeroIsize, NonZeroU32},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use windows_sys::Win32::{
@@ -34,6 +38,7 @@ pub struct Request {
     pub camera: usize,
     pub environment: Option<Arc<HdrImage>>,
     pub lighting: Lighting,
+    pub needs_pick_mesh: bool,
     pub size: [u32; 2],
     pub refinement: usize,
 }
@@ -43,6 +48,7 @@ impl Request {
         Arc::ptr_eq(&self.scene, &other.scene)
             && self.camera == other.camera
             && self.lighting == other.lighting
+            && self.needs_pick_mesh == other.needs_pick_mesh
             && self.size == other.size
             && match (&self.environment, &other.environment) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -75,12 +81,22 @@ struct Mailbox {
     pending: Option<Request>,
     result: Option<Result<Frame, String>>,
     closed: bool,
+    fatal: Option<String>,
 }
 
 #[derive(Default)]
 struct Shared {
     mailbox: Mutex<Mailbox>,
     work: Condvar,
+    generation: AtomicU64,
+}
+
+impl Shared {
+    fn cancel_pending(&self, mailbox: &mut Mailbox) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        mailbox.pending = None;
+        mailbox.result = None;
+    }
 }
 
 pub struct Preview {
@@ -103,7 +119,7 @@ impl Preview {
             .name("3D preview".into())
             .spawn(move || {
                 if let Err(error) = run_worker(&worker, &ctx) {
-                    worker.mailbox.lock().unwrap().result = Some(Err(error));
+                    worker.mailbox.lock().unwrap().fatal = Some(error);
                     ctx.request_repaint();
                 }
             })
@@ -121,7 +137,13 @@ impl Preview {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
-        let result = self.shared.mailbox.lock().unwrap().result.take();
+        let result = {
+            let mut mailbox = self.shared.mailbox.lock().unwrap();
+            if let Some(error) = mailbox.fatal.take() {
+                self.warning = Some(error);
+            }
+            mailbox.result.take()
+        };
         match result {
             Some(Ok(frame)) => {
                 if self.requested.as_ref().is_some_and(|request| {
@@ -145,6 +167,15 @@ impl Preview {
             Some(Err(error)) => self.warning = Some(error),
             None => {}
         }
+    }
+
+    pub fn suspend(&mut self) {
+        let mut mailbox = self.shared.mailbox.lock().unwrap();
+        self.shared.cancel_pending(&mut mailbox);
+        self.baseline = None;
+        self.requested = None;
+        self.displayed = None;
+        self.texture = None;
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, mut request: Request) {
@@ -249,7 +280,9 @@ impl Preview {
 
 impl Drop for Preview {
     fn drop(&mut self) {
-        self.shared.mailbox.lock().unwrap().closed = true;
+        let mut mailbox = self.shared.mailbox.lock().unwrap();
+        mailbox.closed = true;
+        self.shared.cancel_pending(&mut mailbox);
         self.shared.work.notify_one();
     }
 }
@@ -265,6 +298,16 @@ impl Drop for HiddenWindow {
 }
 
 fn run_worker(shared: &Shared, ui: &egui::Context) -> Result<(), String> {
+    {
+        let mailbox = shared.mailbox.lock().unwrap();
+        let mailbox = shared
+            .work
+            .wait_while(mailbox, |state| !state.closed && state.pending.is_none())
+            .unwrap();
+        if mailbox.closed {
+            return Ok(());
+        }
+    }
     let error = |detail: &dyn std::fmt::Display| format!("3D preview renderer: {detail}");
     // This window and its context belong to this thread. Only CPU pixels cross to the UI.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
@@ -333,7 +376,7 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
     }
     let mut buffer_size = [0; 2];
     'frames: loop {
-        let request = {
+        let (request, generation) = {
             let mailbox = shared.mailbox.lock().unwrap();
             let mut mailbox = shared
                 .work
@@ -342,8 +385,24 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
             if mailbox.closed {
                 break;
             }
-            mailbox.pending.take().unwrap()
+            (
+                mailbox.pending.take().unwrap(),
+                shared.generation.load(Ordering::Relaxed),
+            )
         };
+        let running = || shared.generation.load(Ordering::Relaxed) == generation;
+        let lighting = request.lighting;
+        let uses_rays = lighting.environment
+            && (lighting.ray_reflections || lighting.soft_shadows || lighting.floor_shadows);
+        if (uses_rays || request.needs_pick_mesh) && request.scene.pick_mesh.get().is_none() {
+            let Some(mesh) = PickMesh::build_while(&request.scene.vertices, &running) else {
+                continue;
+            };
+            let _ = request.scene.pick_mesh.set(mesh);
+        }
+        if !running() {
+            continue;
+        }
         if scene
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &request.scene))
@@ -351,24 +410,29 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
             renderer.upload(gl, &request.scene.vertices)?;
             scene = Some(request.scene.clone());
         }
+        if !running() {
+            continue;
+        }
         if let Some(image) = &request.environment
             && environment
                 .as_ref()
                 .is_none_or(|current| !Arc::ptr_eq(current, image))
         {
-            renderer.upload_environment(gl, image);
+            if !renderer.upload_environment(gl, image, &running) {
+                continue;
+            }
             environment = Some(image.clone());
         }
-        let lighting = request.lighting;
-        let warning = if lighting.environment
-            && (lighting.ray_reflections || lighting.soft_shadows || lighting.floor_shadows)
-        {
-            renderer
-                .prepare_ray_mesh(gl, &request.scene.pick_mesh, &request.scene.vertices)
-                .map(str::to_owned)
-        } else {
-            None
-        };
+        let warning = request
+            .scene
+            .pick_mesh
+            .get()
+            .filter(|_| uses_rays && running())
+            .and_then(|mesh| renderer.prepare_ray_mesh(gl, mesh, &request.scene.vertices, &running))
+            .map(str::to_owned);
+        if !running() {
+            continue;
+        }
         let scale = (max_size as f32 / request.size[0].max(request.size[1]) as f32).min(1.0);
         let size = request
             .size
@@ -399,10 +463,13 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
                     || gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE
                 {
                     buffer_size = [0; 2];
-                    shared.mailbox.lock().unwrap().result = Some(Err(format!(
-                        "Could not allocate the {width} × {height} preview. Lower the idle or minimum preview resolution."
-                    )));
-                    ui.request_repaint();
+                    let mut mailbox = shared.mailbox.lock().unwrap();
+                    if running() {
+                        mailbox.result = Some(Err(format!(
+                            "Could not allocate the {width} × {height} preview. Lower the idle or minimum preview resolution."
+                        )));
+                        ui.request_repaint();
+                    }
                     continue;
                 }
             }
@@ -411,20 +478,11 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
         let mut pixels = vec![0; width as usize * height as usize * 4];
         unsafe {
             gl.viewport(0, 0, width, height);
-            let band = if lighting.environment
-                && (lighting.soft_shadows || lighting.floor_shadows || lighting.ray_reflections)
-            {
-                96
-            } else {
-                height
-            };
+            let band = if uses_rays { 96 } else { height };
             for y in (0..height).step_by(band as usize) {
                 {
                     let mailbox = shared.mailbox.lock().unwrap();
-                    if mailbox.closed {
-                        break 'frames;
-                    }
-                    if request.refinement != 0 && mailbox.pending.is_some() {
+                    if !running() || (request.refinement != 0 && mailbox.pending.is_some()) {
                         continue 'frames;
                     }
                 }
@@ -434,8 +492,8 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
                 // Bound individual GPU submissions so the UI context can make progress.
                 gl.finish();
             }
-            if shared.mailbox.lock().unwrap().closed {
-                break;
+            if !running() {
+                continue;
             }
             gl.read_pixels(
                 0,
@@ -446,6 +504,9 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
                 glow::UNSIGNED_BYTE,
                 glow::PixelPackData::Slice(Some(&mut pixels)),
             );
+        }
+        if !running() {
+            continue;
         }
         let pixels = pixels
             .chunks_exact(width as usize * 4)
@@ -458,12 +519,15 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
             })
             .collect();
         let image = egui::ColorImage::new(size.map(|v| v as usize), pixels);
-        shared.mailbox.lock().unwrap().result = Some(Ok(Frame {
-            request,
-            image,
-            warning,
-        }));
-        ui.request_repaint();
+        let mut mailbox = shared.mailbox.lock().unwrap();
+        if running() {
+            mailbox.result = Some(Ok(Frame {
+                request,
+                image,
+                warning,
+            }));
+            ui.request_repaint();
+        }
     }
     renderer.destroy(gl);
     Ok(())
@@ -472,6 +536,30 @@ fn render_frames(gl: &glow::Context, shared: &Shared, ui: &egui::Context) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspending_discards_queued_work_and_invalidates_the_active_generation() {
+        let shared = Shared::default();
+        let path = std::path::Path::new("tests/fixtures/basic.abc");
+        let scene = Arc::new(crate::scene::load(path, 0.0).unwrap());
+        assert!(scene.pick_mesh.get().is_none());
+        let generation = shared.generation.load(Ordering::Relaxed);
+        let mut mailbox = shared.mailbox.lock().unwrap();
+        mailbox.pending = Some(Request {
+            scene,
+            camera: 0,
+            environment: None,
+            lighting: Lighting::default(),
+            needs_pick_mesh: false,
+            size: [100, 50],
+            refinement: 0,
+        });
+        mailbox.result = Some(Err("Old frame".to_owned()));
+        shared.cancel_pending(&mut mailbox);
+        assert!(mailbox.pending.is_none());
+        assert!(mailbox.result.is_none());
+        assert_ne!(shared.generation.load(Ordering::Relaxed), generation);
+    }
 
     #[test]
     fn idle_quality_steps_from_the_minimum_and_respects_user_limits() {

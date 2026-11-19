@@ -4,7 +4,10 @@ use crate::{
     light_paint::PickMesh,
 };
 use glam::{DVec3, Vec3};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -17,7 +20,7 @@ pub struct Scene {
     pub path: PathBuf,
     pub nodes: Vec<Node>,
     pub vertices: Vec<Vertex>,
-    pub pick_mesh: PickMesh,
+    pub pick_mesh: OnceLock<PickMesh>,
     pub cameras: Vec<Camera>,
     pub warnings: Vec<String>,
     pub meshes: usize,
@@ -40,7 +43,7 @@ pub fn load(path: &Path, seconds: f64) -> Result<Scene, String> {
         path: path.into(),
         nodes,
         vertices: vec![],
-        pick_mesh: PickMesh::default(),
+        pick_mesh: OnceLock::new(),
         cameras: vec![],
         warnings: vec![],
         meshes: 0,
@@ -103,7 +106,6 @@ pub fn load(path: &Path, seconds: f64) -> Result<Scene, String> {
             .warnings
             .push("No usable camera. Export a camera with the mesh.".into());
     }
-    scene.pick_mesh = PickMesh::new(&scene.vertices);
     Ok(scene)
 }
 

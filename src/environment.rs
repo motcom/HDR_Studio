@@ -267,6 +267,31 @@ pub enum LightShape {
     Round,
     Gradient,
     Image,
+    CompositeLight,
+}
+
+impl LightShape {
+    pub const ALL: [Self; 5] = [
+        Self::Round,
+        Self::Rectangle,
+        Self::Gradient,
+        Self::Image,
+        Self::CompositeLight,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Round => "Round",
+            Self::Rectangle => "Rectangle",
+            Self::Gradient => "Gradient",
+            Self::Image => "Image",
+            Self::CompositeLight => "CompositeLight",
+        }
+    }
+
+    pub fn is_positioned(self) -> bool {
+        matches!(self, Self::Rectangle | Self::Round | Self::Gradient)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -309,6 +334,18 @@ pub fn panorama_uv(direction: Vec3) -> glam::Vec2 {
     };
     let latitude = direction.y.atan2(horizontal);
     glam::Vec2::new((0.5 + longitude / TAU).rem_euclid(1.0), 0.5 - latitude / PI)
+}
+
+pub fn panorama_rotation(from: glam::Vec2, to: glam::Vec2) -> glam::Quat {
+    let (from_lon, from_lat) = panorama_angles(from.x, from.y);
+    let (to_lon, to_lat) = panorama_angles(to.x, to.y);
+    if from.y == to.y {
+        return glam::Quat::from_rotation_y(from_lon - to_lon);
+    }
+    // Tilt along the grabbed point's meridian, then turn to the new longitude.
+    glam::Quat::from_rotation_y(-to_lon)
+        * glam::Quat::from_rotation_z(to_lat - from_lat)
+        * glam::Quat::from_rotation_y(from_lon)
 }
 
 impl Projection {
@@ -389,7 +426,7 @@ impl FalloffPreset {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct FalloffCurve {
     pub points: Vec<[f32; 2]>,
     pub preset: Option<FalloffPreset>,
@@ -505,6 +542,7 @@ pub struct ImageLayer {
     pub exposure: f32,
     pub alpha: f32,
     pub linear: bool,
+    pub blend: BlendMode,
 }
 
 impl Default for ImageLayer {
@@ -516,15 +554,34 @@ impl Default for ImageLayer {
             exposure: 0.0,
             alpha: 1.0,
             linear: true,
+            blend: BlendMode::Over,
         }
     }
 }
 
-#[derive(Clone)]
+impl PartialEq for ImageLayer {
+    fn eq(&self, other: &Self) -> bool {
+        let same_image = match (&self.image, &other.image) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_image
+            && self.source == other.source
+            && self.rotation == other.rotation
+            && self.exposure == other.exposure
+            && self.alpha == other.alpha
+            && self.linear == other.linear
+            && self.blend == other.blend
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Light {
     pub id: u32,
     pub name: String,
     pub enabled: bool,
+    pub locked: bool,
     pub u: f32,
     pub v: f32,
     pub width_degrees: f32,
@@ -538,8 +595,11 @@ pub struct Light {
     pub color: [f32; 3],
     pub blend: BlendMode,
     pub invert: bool,
+    pub multiply_mask: bool,
     pub shape: LightShape,
     pub image_layer: ImageLayer,
+    pub composite: Option<Box<Document>>,
+    composite_rotation: glam::Quat,
     pub mapping: LightMapping,
     pub core: [f32; 2],
     pub cut_enabled: bool,
@@ -547,6 +607,44 @@ pub struct Light {
     pub cut_amount: f32,
 }
 impl Light {
+    pub fn blend_mode(&mut self) -> &mut BlendMode {
+        if self.shape == LightShape::Image {
+            &mut self.image_layer.blend
+        } else {
+            &mut self.blend
+        }
+    }
+
+    pub fn position(&self) -> glam::Vec2 {
+        if self.shape == LightShape::CompositeLight {
+            panorama_uv(self.composite_rotation.conjugate() * Vec3::X)
+        } else {
+            glam::Vec2::new(self.u, self.v)
+        }
+    }
+
+    pub fn set_position(&mut self, position: glam::Vec2) {
+        if self.shape == LightShape::CompositeLight {
+            let rotation = panorama_rotation(self.position(), position);
+            self.set_composite_local_rotation(self.composite_rotation * rotation.conjugate());
+        } else {
+            self.u = position.x;
+            self.v = position.y;
+        }
+    }
+
+    pub fn composite_local_rotation(&self) -> glam::Quat {
+        self.composite_rotation
+    }
+
+    pub fn set_composite_local_rotation(&mut self, rotation: glam::Quat) {
+        self.composite_rotation = rotation.normalize();
+    }
+
+    pub fn can_move(&self) -> bool {
+        self.enabled && !self.locked && self.shape != LightShape::Image
+    }
+
     fn tangent_half_size(&self) -> glam::Vec2 {
         // The tangent plane approaches infinity at a 180-degree field of view.
         glam::Vec2::new(
@@ -589,7 +687,7 @@ impl Light {
         let extent = match self.shape {
             LightShape::Rectangle | LightShape::Gradient => normal.abs().element_sum(),
             LightShape::Round => 1.0,
-            LightShape::Image => return None,
+            LightShape::Image | LightShape::CompositeLight => return None,
         };
         Some((normal, extent * (1.0 - 2.0 * self.cut_amount)))
     }
@@ -620,18 +718,32 @@ impl Light {
         let inside = match self.shape {
             LightShape::Rectangle | LightShape::Gradient => p.abs().max_element() < 1.0,
             LightShape::Round => p.length_squared() < 1.0,
-            LightShape::Image => false,
+            LightShape::Image | LightShape::CompositeLight => false,
         };
         inside && cut.is_none_or(|(normal, distance)| normal.dot(p) <= distance)
     }
 
     pub fn hit(&self, u: f32, v: f32) -> bool {
-        self.enabled
-            && self.shape != LightShape::Image
-            && self
-                .projection()
-                .local(glam::Vec2::new(u, v), panorama_direction(u, v))
-                .is_some_and(|position| self.covers(position, self.cut_plane()))
+        self.enabled && self.hit_visible(u, v)
+    }
+
+    pub fn hit_visible(&self, u: f32, v: f32) -> bool {
+        if self.locked || self.shape == LightShape::Image {
+            return false;
+        }
+        let uv = glam::Vec2::new(u, v);
+        let direction = panorama_direction(u, v);
+        if self.shape == LightShape::CompositeLight {
+            let Some(content) = self.composite.as_deref() else {
+                return false;
+            };
+            let transform = CompositeTransform::new(self);
+            let (uv, direction) = transform.to_local(uv, direction);
+            return PreparedDocument::new(content).sample(uv, direction).alpha > 0.01;
+        }
+        self.projection()
+            .local(uv, direction)
+            .is_some_and(|position| self.covers(position, self.cut_plane()))
     }
 
     fn profile(&self, p: glam::Vec2, falloff: &FalloffTable) -> f32 {
@@ -650,7 +762,7 @@ impl Light {
                 falloff.sample((b + (b * b + a * c).sqrt()) / c)
             }
             LightShape::Gradient => falloff.sample(0.5 + p.dot(falloff.gradient_axis)),
-            LightShape::Image => 0.0,
+            LightShape::Image | LightShape::CompositeLight => 0.0,
         }
     }
 
@@ -662,7 +774,9 @@ impl Light {
                 falloff.gradient_axis = axis * (0.5 / axis.abs().element_sum());
                 falloff
             }
-            LightShape::Round | LightShape::Image => self.falloff.bake(false),
+            LightShape::Round | LightShape::Image | LightShape::CompositeLight => {
+                self.falloff.bake(false)
+            }
             LightShape::Rectangle => {
                 let mut falloff = self.falloff.bake(true);
                 if !self.box_link_axes
@@ -674,25 +788,25 @@ impl Light {
             }
         }
     }
+}
 
-    fn blend_at(&self, underneath: Vec3, position: glam::Vec2, falloff: &FalloffTable) -> Vec3 {
-        let color = Vec3::from_array(self.color) * self.intensity;
-        let profile = self.profile(position, falloff);
+impl BlendMode {
+    fn apply(self, underneath: Vec3, color: Vec3, profile: f32, invert: bool) -> Vec3 {
         let light = color * profile;
-        match self.blend {
-            BlendMode::Add if self.invert => {
+        match self {
+            Self::Add if invert => {
                 let value = (underneath.max_element() - light.max_element()).max(0.0);
                 with_value(underneath, value)
             }
-            BlendMode::Add => underneath + light,
-            BlendMode::Multiply => underneath * light,
-            BlendMode::Amplify if self.invert => underneath / (Vec3::ONE + light),
-            BlendMode::Amplify => underneath * (Vec3::ONE + light),
-            BlendMode::Over => underneath.lerp(color, profile),
-            BlendMode::LowPass => {
+            Self::Add => underneath + light,
+            Self::Multiply => underneath * light,
+            Self::Amplify if invert => underneath / (Vec3::ONE + light),
+            Self::Amplify => underneath * (Vec3::ONE + light),
+            Self::Over => underneath.lerp(color, profile),
+            Self::LowPass => {
                 let base_value = underneath.max_element();
                 let limit = color.max_element();
-                let target = if self.invert {
+                let target = if invert {
                     base_value.max(limit)
                 } else {
                     base_value.min(limit)
@@ -718,10 +832,13 @@ fn with_value(rgb: Vec3, value: f32) -> Vec3 {
 enum ComposedLayer<'a> {
     Image {
         source: &'a HdrImage,
-        rotation: f32,
+        light: &'a Light,
         gain: f32,
-        alpha: f32,
-        linear: bool,
+    },
+    Composite {
+        light: &'a Light,
+        content: PreparedDocument<'a>,
+        transform: CompositeTransform,
     },
     Light {
         light: &'a Light,
@@ -731,7 +848,60 @@ enum ComposedLayer<'a> {
     },
 }
 
-#[derive(Clone)]
+struct CompositeTransform {
+    rotation: glam::Quat,
+    yaw_offset: Option<f32>,
+}
+
+impl CompositeTransform {
+    fn new(light: &Light) -> Self {
+        let rotation = light.composite_local_rotation();
+        let yaw_offset = (rotation.x == 0.0 && rotation.z == 0.0).then(|| light.position().x - 0.5);
+        Self {
+            rotation,
+            yaw_offset,
+        }
+    }
+
+    fn to_local(&self, mut uv: glam::Vec2, direction: Vec3) -> (glam::Vec2, Vec3) {
+        let direction = self.rotation * direction;
+        if let Some(yaw_offset) = self.yaw_offset {
+            uv.x = (uv.x - yaw_offset).rem_euclid(1.0);
+        } else {
+            uv = panorama_uv(direction);
+        }
+        (uv, direction)
+    }
+}
+
+struct PreparedDocument<'a> {
+    layers: Vec<ComposedLayer<'a>>,
+    spherical: bool,
+    gain: f32,
+    rotation: f32,
+    rotation_sin: f32,
+    rotation_cos: f32,
+}
+
+#[derive(Default)]
+struct CompositePixel {
+    rgb: Vec3,
+    alpha: f32,
+}
+
+impl CompositePixel {
+    fn blend(&mut self, mode: BlendMode, color: Vec3, profile: f32, invert: bool, mask: bool) {
+        self.rgb = mode.apply(self.rgb, color, profile, invert);
+        if mask {
+            self.alpha *= profile;
+        } else if matches!(mode, BlendMode::Over) || (mode == BlendMode::Add && !invert) {
+            let coverage = profile.clamp(0.0, 1.0);
+            self.alpha += (1.0 - self.alpha) * coverage;
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Document {
     pub exposure: f32,
     pub rotation: f32,
@@ -758,7 +928,7 @@ impl Document {
         let mut light = self
             .lights
             .get(index)
-            .filter(|light| light.enabled && light.shape != LightShape::Image)?
+            .filter(|light| light.enabled && light.shape.is_positioned())?
             .clone();
         let falloff = light.bake_falloff();
         let white_level = if light.shape == LightShape::Gradient {
@@ -808,6 +978,7 @@ impl Document {
             id,
             name: format!("Round {id}"),
             enabled: true,
+            locked: false,
             u: 0.75,
             v: 0.45,
             width_degrees: 40.0,
@@ -821,8 +992,11 @@ impl Document {
             color: [1.0; 3],
             blend: BlendMode::Add,
             invert: false,
+            multiply_mask: false,
             shape: LightShape::Round,
             image_layer: ImageLayer::default(),
+            composite: None,
+            composite_rotation: glam::Quat::IDENTITY,
             mapping: LightMapping::Spherical,
             core: [0.0; 2],
             cut_enabled: false,
@@ -832,45 +1006,23 @@ impl Document {
         self.lights.len() - 1
     }
     pub fn compose(&self, width: u32, height: u32) -> HdrImage {
-        let gain = 2.0_f32.powf(self.exposure);
-        let layers: Vec<_> = self
-            .lights
-            .iter()
-            .filter(|light| light.enabled)
-            .filter_map(|light| {
-                if light.shape == LightShape::Image {
-                    let layer = &light.image_layer;
-                    let source = layer.image.as_deref().filter(|_| layer.alpha > 0.0)?;
-                    Some(ComposedLayer::Image {
-                        source,
-                        rotation: layer.rotation / 360.0,
-                        gain: 2.0_f32.powf(layer.exposure),
-                        alpha: layer.alpha,
-                        linear: layer.linear,
-                    })
-                } else {
-                    Some(ComposedLayer::Light {
-                        light,
-                        projection: light.projection(),
-                        cut: light.cut_plane(),
-                        falloff: Box::new(light.bake_falloff()),
-                    })
-                }
-            })
-            .collect();
-        let spherical = layers.iter().any(|layer| {
-            matches!(
-                layer,
-                ComposedLayer::Light {
-                    projection: Projection::Spherical { .. },
-                    ..
-                }
-            )
-        });
+        self.compose_while(width, height, || true).unwrap()
+    }
+
+    pub fn compose_while(
+        &self,
+        width: u32,
+        height: u32,
+        running: impl Fn() -> bool,
+    ) -> Option<HdrImage> {
+        if !running() {
+            return None;
+        }
+        let document = PreparedDocument::new(self);
         let columns: Vec<_> = (0..width)
             .map(|x| {
-                let u = ((x as f32 + 0.5) / width as f32 - self.rotation / 360.0).rem_euclid(1.0);
-                let (sin, cos) = if spherical {
+                let u = ((x as f32 + 0.5) / width as f32 - document.rotation).rem_euclid(1.0);
+                let (sin, cos) = if document.spherical {
                     panorama_angles(u, 0.5).0.sin_cos()
                 } else {
                     (0.0, 0.0)
@@ -880,63 +1032,262 @@ impl Document {
             .collect();
         let mut pixels = Vec::with_capacity((width * height) as usize);
         for y in 0..height {
+            if !running() {
+                return None;
+            }
             let v = (y as f32 + 0.5) / height as f32;
-            let (sin_lat, cos_lat) = if spherical {
+            let (sin_lat, cos_lat) = if document.spherical {
                 panorama_angles(0.5, v).1.sin_cos()
             } else {
                 (0.0, 0.0)
             };
             for &(u, sin_lon, cos_lon) in &columns {
-                let uv = glam::Vec2::new(u, v);
                 let direction = Vec3::new(cos_lon * cos_lat, sin_lat, sin_lon * cos_lat);
-                let mut rgb = Vec3::ZERO;
-                for layer in &layers {
-                    match layer {
-                        ComposedLayer::Image {
-                            source,
-                            rotation,
-                            gain,
-                            alpha,
-                            linear,
-                        } => {
-                            let color = if *linear {
-                                source.sample(u - rotation, v)
-                            } else {
-                                source.sample_color(u - rotation, v, false)
-                            };
-                            rgb = rgb.lerp(color * *gain, *alpha).min(Vec3::splat(1.0e30));
-                        }
-                        ComposedLayer::Light {
-                            light,
-                            projection,
-                            cut,
-                            falloff,
-                        } => {
-                            if let Some(position) = projection.local(uv, direction)
-                                && light.covers(position, *cut)
-                            {
-                                // Keep stacked gains within representable RGBE range.
-                                rgb = light
-                                    .blend_at(rgb, position, falloff)
-                                    .min(Vec3::splat(1.0e30));
-                            }
-                        }
-                    }
-                }
-                pixels.push((rgb * gain).to_array());
+                let pixel = document.sample_layers(glam::Vec2::new(u, v), direction);
+                pixels.push(pixel.rgb.to_array());
             }
         }
-        HdrImage {
+        Some(HdrImage {
             width,
             height,
             pixels,
+        })
+    }
+}
+
+impl<'a> PreparedDocument<'a> {
+    fn new(document: &'a Document) -> Self {
+        let layers: Vec<_> = document
+            .lights
+            .iter()
+            .filter(|light| light.enabled)
+            .filter_map(|light| match light.shape {
+                LightShape::Image => {
+                    let image = &light.image_layer;
+                    Some(ComposedLayer::Image {
+                        source: image.image.as_deref().filter(|_| image.alpha > 0.0)?,
+                        light,
+                        gain: 2.0_f32.powf(image.exposure),
+                    })
+                }
+                LightShape::CompositeLight => Some(ComposedLayer::Composite {
+                    light,
+                    content: Self::new(light.composite.as_deref()?),
+                    transform: CompositeTransform::new(light),
+                }),
+                _ => Some(ComposedLayer::Light {
+                    light,
+                    projection: light.projection(),
+                    cut: light.cut_plane(),
+                    falloff: Box::new(light.bake_falloff()),
+                }),
+            })
+            .collect();
+        let spherical = layers.iter().any(|layer| match layer {
+            ComposedLayer::Light { projection, .. } => {
+                matches!(projection, Projection::Spherical { .. })
+            }
+            ComposedLayer::Composite {
+                content, transform, ..
+            } => content.spherical || transform.yaw_offset.is_none(),
+            ComposedLayer::Image { .. } => false,
+        });
+        let rotation = document.rotation / 360.0;
+        let (rotation_sin, rotation_cos) = (rotation * TAU).sin_cos();
+        Self {
+            layers,
+            spherical,
+            gain: 2.0_f32.powf(document.exposure),
+            rotation,
+            rotation_sin,
+            rotation_cos,
         }
+    }
+
+    fn sample(&self, mut uv: glam::Vec2, direction: Vec3) -> CompositePixel {
+        uv.x = (uv.x - self.rotation).rem_euclid(1.0);
+        let direction = Vec3::new(
+            direction.x * self.rotation_cos + direction.z * self.rotation_sin,
+            direction.y,
+            direction.z * self.rotation_cos - direction.x * self.rotation_sin,
+        );
+        self.sample_layers(uv, direction)
+    }
+
+    fn sample_layers(&self, uv: glam::Vec2, direction: Vec3) -> CompositePixel {
+        let mut pixel = CompositePixel::default();
+        for layer in &self.layers {
+            match layer {
+                ComposedLayer::Image {
+                    source,
+                    light,
+                    gain,
+                } => {
+                    let image = &light.image_layer;
+                    let u = uv.x - image.rotation / 360.0;
+                    let sample = if image.linear {
+                        source.sample(u, uv.y)
+                    } else {
+                        source.sample_color(u, uv.y, false)
+                    } * *gain;
+                    if image.blend == BlendMode::Multiply {
+                        pixel.rgb = pixel.rgb.lerp(pixel.rgb * sample, image.alpha);
+                        if light.multiply_mask {
+                            let coverage = sample.max_element().clamp(0.0, 1.0);
+                            pixel.alpha *= 1.0 - image.alpha * (1.0 - coverage);
+                        }
+                    } else {
+                        pixel.blend(image.blend, sample, image.alpha, light.invert, false);
+                    }
+                }
+                ComposedLayer::Composite {
+                    light,
+                    content,
+                    transform,
+                } => {
+                    let (local_uv, local_direction) = transform.to_local(uv, direction);
+                    let source = content.sample(local_uv, local_direction);
+                    let mask = light.blend == BlendMode::Multiply && light.multiply_mask;
+                    if source.alpha > 0.0 {
+                        pixel.blend(
+                            light.blend,
+                            source.rgb / source.alpha,
+                            source.alpha,
+                            light.invert,
+                            mask,
+                        );
+                    } else if mask {
+                        pixel = CompositePixel::default();
+                    }
+                }
+                ComposedLayer::Light {
+                    light,
+                    projection,
+                    cut,
+                    falloff,
+                } => {
+                    let mask = light.blend == BlendMode::Multiply && light.multiply_mask;
+                    if let Some(position) = projection.local(uv, direction)
+                        && light.covers(position, *cut)
+                    {
+                        let color = Vec3::from_array(light.color) * light.intensity;
+                        pixel.blend(
+                            light.blend,
+                            color,
+                            light.profile(position, falloff),
+                            light.invert,
+                            mask,
+                        );
+                    } else if mask {
+                        pixel = CompositePixel::default();
+                    }
+                }
+            }
+            // Keep stacked gains within representable RGBE range.
+            pixel.rgb = pixel.rgb.min(Vec3::splat(1.0e30));
+        }
+        pixel.rgb *= self.gain;
+        pixel
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_a_composite_rotates_its_content_and_hit_region_together() {
+        let mut parent = Document::default();
+        let composite = parent.add_light();
+        let mut content = Document::default();
+        let child = content.add_light();
+        content.lights[child].u = 0.5;
+        content.lights[child].v = 0.5;
+        let light = &mut parent.lights[composite];
+        light.shape = LightShape::CompositeLight;
+        light.composite = Some(Box::new(content));
+        let position = glam::Vec2::new(0.75, 0.3);
+        light.set_position(position);
+        assert!(light.hit(position.x, position.y));
+        assert!(!light.hit(0.5, 0.5));
+        let moved = parent.compose(10, 5);
+        assert!(moved.pixels[17][0] > 9.9);
+        parent.lights[composite].locked = true;
+        assert!(!parent.lights[composite].hit(position.x, position.y));
+        assert_eq!(parent.compose(10, 5).pixels, moved.pixels);
+    }
+
+    #[test]
+    fn multiply_mask_blacks_out_uncovered_pixels_but_only_in_multiply() {
+        let mut doc = Document::default();
+        let background = doc.add_light();
+        let light = &mut doc.lights[background];
+        light.shape = LightShape::Image;
+        light.image_layer.image = Some(Arc::new(HdrImage {
+            width: 2,
+            height: 1,
+            pixels: vec![[3.0; 3]; 2],
+        }));
+        let mask = doc.add_light();
+        let light = &mut doc.lights[mask];
+        light.u = 0.5;
+        light.v = 0.5;
+        light.intensity = 0.5;
+        light.blend = BlendMode::Multiply;
+
+        let unmasked = doc.compose(9, 5);
+        assert_eq!(unmasked.pixels[18], [3.0; 3]);
+        assert_eq!(unmasked.pixels[22], [1.5; 3]);
+        doc.lights[mask].multiply_mask = true;
+        let masked = doc.compose(9, 5);
+        assert_eq!(masked.pixels[18], [0.0; 3]);
+        assert_eq!(masked.pixels[22], unmasked.pixels[22]);
+
+        doc.lights[mask].blend = BlendMode::Add;
+        assert_eq!(doc.compose(9, 5).pixels[18], [3.0; 3]);
+        doc.lights[mask].blend = BlendMode::Multiply;
+        doc.lights[mask].enabled = false;
+        assert_eq!(doc.compose(9, 5).pixels, vec![[3.0; 3]; 45]);
+    }
+
+    #[test]
+    fn composite_children_are_isolated_and_can_mask_the_parent_stack() {
+        let mut doc = Document::default();
+        let background = doc.add_light();
+        let light = &mut doc.lights[background];
+        light.shape = LightShape::Image;
+        light.image_layer.image = Some(Arc::new(HdrImage {
+            width: 2,
+            height: 1,
+            pixels: vec![[4.0; 3]; 2],
+        }));
+        let group = doc.add_light();
+        let mut child = Document {
+            rotation: 144.0,
+            ..Document::default()
+        };
+        let inner = child.add_light();
+        let light = &mut child.lights[inner];
+        light.u = 0.5;
+        light.v = 0.5;
+        light.intensity = 0.5;
+        light.blend = BlendMode::Multiply;
+
+        doc.lights[group].shape = LightShape::CompositeLight;
+        doc.lights[group].composite = Some(Box::new(child));
+        assert_eq!(doc.compose(5, 3).pixels, vec![[4.0; 3]; 15]);
+        doc.lights[group].composite.as_mut().unwrap().lights[inner].blend = BlendMode::Add;
+        let added = doc.compose(5, 3);
+        assert_eq!(added.pixels[7], [4.0; 3]);
+        assert_eq!(added.pixels[9], [4.5; 3]);
+
+        doc.lights[group].blend = BlendMode::Multiply;
+        assert_eq!(doc.compose(5, 3).pixels[7], [4.0; 3]);
+        doc.lights[group].multiply_mask = true;
+        let masked = doc.compose(5, 3);
+        assert_eq!(masked.pixels[7], [0.0; 3]);
+        assert!(Vec3::from_array(masked.pixels[9]).abs_diff_eq(Vec3::splat(2.0), 1e-5));
+    }
 
     #[test]
     fn image_layers_rotate_and_composite_with_independent_color_settings() {
@@ -1174,7 +1525,12 @@ mod tests {
         ] {
             light.blend = mode;
             assert_eq!(
-                light.blend_at(base, glam::Vec2::ZERO, &light.bake_falloff()),
+                light.blend.apply(
+                    base,
+                    Vec3::from_array(light.color) * light.intensity,
+                    light.profile(glam::Vec2::ZERO, &light.bake_falloff()),
+                    light.invert
+                ),
                 expected
             );
             assert!(!light.hit(light.u + 0.5, light.v));

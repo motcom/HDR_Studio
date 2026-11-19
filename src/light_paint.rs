@@ -143,37 +143,53 @@ pub struct PickMesh {
 }
 
 impl PickMesh {
+    #[cfg(test)]
     pub fn new(vertices: &[Vertex]) -> Self {
-        let bounds: Vec<_> = vertices
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|triangle| {
+        Self::build_while(vertices, &|| true).unwrap()
+    }
+
+    pub fn build_while(vertices: &[Vertex], running: &impl Fn() -> bool) -> Option<Self> {
+        let mut bounds = Vec::with_capacity(vertices.len() / 3);
+        for batch in vertices.as_chunks::<3>().0.chunks(4096) {
+            if !running() {
+                return None;
+            }
+            bounds.extend(batch.iter().map(|triangle| {
                 let [a, b, c] = triangle.each_ref().map(position);
                 Bounds {
                     min: a.min(b).min(c),
                     max: a.max(b).max(c),
                 }
-            })
-            .collect();
+            }));
+        }
         let mut triangles: Vec<_> = (0..bounds.len()).collect();
         let mut nodes = Vec::new();
         if !triangles.is_empty() {
-            Self::build(&mut nodes, &mut triangles, &bounds, 0);
+            Self::build(&mut nodes, &mut triangles, &bounds, 0, running)?;
         }
-        Self { nodes, triangles }
+        Some(Self { nodes, triangles })
     }
 
     pub fn ray_texel_count(&self) -> usize {
         self.nodes.len() * 2 + self.triangles.len() * 3
     }
 
-    pub fn write_ray_texels(&self, vertices: &[Vertex], texels: &mut [[u32; 4]]) -> i32 {
+    pub fn write_ray_texels(
+        &self,
+        vertices: &[Vertex],
+        texels: &mut [[u32; 4]],
+        running: &impl Fn() -> bool,
+    ) -> Option<i32> {
         let node_count = self.nodes.len();
-        self.write_ray_node(0, node_count, texels);
+        if !self.write_ray_node(0, node_count, texels, running) {
+            return None;
+        }
         // GPU leaf ranges use the same triangle ordering as the CPU BVH.
         let (triangles, _) = texels[node_count * 2..].as_chunks_mut::<3>();
-        for (&index, triangle) in self.triangles.iter().zip(triangles) {
+        for (offset, (&index, triangle)) in self.triangles.iter().zip(triangles).enumerate() {
+            if offset.is_multiple_of(4096) && !running() {
+                return None;
+            }
             for (i, vertex) in vertices[index * 3..][..3].iter().enumerate() {
                 let [x, y, z] = vertex.position.map(f32::to_bits);
                 let [nx, ny, nz] = vertex
@@ -182,10 +198,19 @@ impl PickMesh {
                 triangle[i] = [x, y, z, nx | (ny << 10) | (nz << 20)];
             }
         }
-        node_count as i32
+        Some(node_count as i32)
     }
 
-    fn write_ray_node(&self, index: usize, escape: usize, texels: &mut [[u32; 4]]) {
+    fn write_ray_node(
+        &self,
+        index: usize,
+        escape: usize,
+        texels: &mut [[u32; 4]],
+        running: &impl Fn() -> bool,
+    ) -> bool {
+        if index.is_multiple_of(1024) && !running() {
+            return false;
+        }
         let (bounds, start, end) = match self.nodes[index] {
             PickNode::Leaf { bounds, start, end } => (bounds, start as u32, end as u32),
             PickNode::Branch {
@@ -193,8 +218,11 @@ impl PickMesh {
                 left,
                 right,
             } => {
-                self.write_ray_node(left, right, texels);
-                self.write_ray_node(right, escape, texels);
+                if !self.write_ray_node(left, right, texels, running)
+                    || !self.write_ray_node(right, escape, texels, running)
+                {
+                    return false;
+                }
                 (bounds, u32::MAX, escape as u32)
             }
         };
@@ -202,6 +230,7 @@ impl PickMesh {
         texels[index * 2] = [x, y, z, start];
         let [x, y, z] = bounds.max.as_vec3().to_array().map(f32::to_bits);
         texels[index * 2 + 1] = [x, y, z, end];
+        true
     }
 
     fn build(
@@ -209,7 +238,11 @@ impl PickMesh {
         triangles: &mut [usize],
         boxes: &[Bounds],
         start: usize,
-    ) -> usize {
+        running: &impl Fn() -> bool,
+    ) -> Option<usize> {
+        if !running() {
+            return None;
+        }
         let bounds = triangles.iter().fold(boxes[triangles[0]], |b, &i| Bounds {
             min: b.min.min(boxes[i].min),
             max: b.max.max(boxes[i].max),
@@ -228,15 +261,15 @@ impl PickMesh {
                     .total_cmp(&(boxes[b].min[axis] + boxes[b].max[axis]))
             });
             let (left, right) = triangles.split_at_mut(mid);
-            let left = Self::build(nodes, left, boxes, start);
-            let right = Self::build(nodes, right, boxes, start + mid);
+            let left = Self::build(nodes, left, boxes, start, running)?;
+            let right = Self::build(nodes, right, boxes, start + mid, running)?;
             nodes[index] = PickNode::Branch {
                 bounds,
                 left,
                 right,
             };
         }
-        index
+        Some(index)
     }
 
     fn visit(
