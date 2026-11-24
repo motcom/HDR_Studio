@@ -1,6 +1,11 @@
 use crate::renderer::{Lighting, PREVIEW_SCALE_OPTIONS, SHADOW_SAMPLE_OPTIONS};
 use std::{fs, io, path::PathBuf};
 
+pub(crate) fn app_data_dir() -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    root.is_absolute().then(|| root.join("HDR STUDIO"))
+}
+
 pub struct Settings {
     path: PathBuf,
     last_value: Lighting,
@@ -9,9 +14,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn open() -> Option<Self> {
-        let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-            .join("HDR STUDIO")
-            .join("settings.json");
+        let path = app_data_dir()?.join("settings.json");
         Some(Self::read(path))
     }
 

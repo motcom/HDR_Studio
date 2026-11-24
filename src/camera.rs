@@ -2,7 +2,7 @@ use crate::abc::Node;
 use glam::{DMat3, DMat4, DVec3};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct Camera {
     pub path: String,
     pub view: DMat4,

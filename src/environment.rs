@@ -1,5 +1,6 @@
 use glam::Vec3;
 use image::{Rgb, codecs::hdr::HdrEncoder};
+use serde::{Deserialize, Serialize};
 use std::{
     f32::consts::{PI, TAU},
     io::Write,
@@ -96,6 +97,13 @@ impl HdrImage {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.write_hdr(|| std::fs::File::create(path))
+    }
+
+    pub(crate) fn write_hdr(
+        &self,
+        open: impl FnOnce() -> std::io::Result<std::fs::File>,
+    ) -> Result<(), String> {
         if self
             .pixels
             .iter()
@@ -104,7 +112,7 @@ impl HdrImage {
         {
             return Err("Cannot export invalid HDR radiance".into());
         }
-        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let file = open().map_err(|error| error.to_string())?;
         let data: Vec<Rgb<f32>> = self.pixels.iter().map(|p| Rgb(*p)).collect();
         let mut writer = std::io::BufWriter::new(file);
         HdrEncoder::new(&mut writer)
@@ -228,7 +236,7 @@ pub fn sh_basis(n: Vec3) -> [f32; 9] {
     ]
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum BlendMode {
     Add,
     Multiply,
@@ -261,7 +269,7 @@ impl BlendMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum LightShape {
     Rectangle,
     Round,
@@ -294,7 +302,7 @@ impl LightShape {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum LightMapping {
     Spherical,
     Flat,
@@ -387,7 +395,7 @@ impl Projection {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FalloffPreset {
     Softbox,
     Smooth,
@@ -426,14 +434,14 @@ impl FalloffPreset {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct FalloffCurve {
     pub points: Vec<[f32; 2]>,
     pub preset: Option<FalloffPreset>,
     pub box_interpolation: BoxInterpolation,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum BoxInterpolation {
     Linear,
     Smooth,
@@ -534,8 +542,9 @@ impl FalloffTable {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ImageLayer {
+    #[serde(skip)]
     pub image: Option<Arc<HdrImage>>,
     pub source: String,
     pub rotation: f32,
@@ -576,7 +585,7 @@ impl PartialEq for ImageLayer {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct Light {
     pub id: u32,
     pub name: String,
@@ -901,7 +910,7 @@ impl CompositePixel {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct Document {
     pub exposure: f32,
     pub rotation: f32,
@@ -919,6 +928,16 @@ impl Default for Document {
     }
 }
 impl Document {
+    pub(crate) fn validate_project_ids(&self) -> bool {
+        let mut ids = std::collections::HashSet::new();
+        self.next_id < u32::MAX
+            && self.lights.len() <= 32
+            && self
+                .lights
+                .iter()
+                .all(|light| light.id > 0 && light.id < self.next_id && ids.insert(light.id))
+    }
+
     pub fn falloff_preview(
         &self,
         index: usize,

@@ -1,10 +1,9 @@
 use crate::{camera::Camera, scene::Vertex};
 use glam::{DVec2, DVec3};
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 pub enum LightPaint {
     #[default]
-    Off,
     Reflection,
     Diffuse,
 }
@@ -17,9 +16,6 @@ impl LightPaint {
         mesh: &PickMesh,
         vertices: &[Vertex],
     ) -> Option<DVec3> {
-        if self == Self::Off {
-            return None;
-        }
         let inverse = (camera.projection * camera.view).inverse();
         let near = inverse.project_point3(ndc.extend(-1.0));
         let far = inverse.project_point3(ndc.extend(1.0));
@@ -79,7 +75,6 @@ impl LightPaint {
             Self::Reflection => {
                 (2.0 * normal.dot(toward_view) * normal - toward_view).try_normalize()
             }
-            Self::Off => None,
         }
     }
 }

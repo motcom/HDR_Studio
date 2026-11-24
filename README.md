@@ -19,11 +19,17 @@ cargo build --release
 ./target/release/HDR_STUDIO.exe C:/temp/lighting.abc
 ```
 
-`Open Alembic…` またはドラッグ＆ドロップで開きます。右側の **Lighting** タブ内の **Fixed camera** でカメラを選び、読み込み情報を確認できます。画枠はウィンドウの大きさに合わせて拡縮し、アスペクト比を維持します。カメラがない場合はカメラの読み込みを促します。
+**Import Alembic…** またはドラッグ＆ドロップで開きます。右側の **Fixed camera** タブでカメラを選び、読み込み情報を確認できます。画枠はウィンドウの大きさに合わせて拡縮し、アスペクト比を維持します。カメラがない場合はカメラの読み込みを促します。
+
+## プロジェクトの保存・読み込み
+
+- **File → New Project** で空のプロジェクトを開始します。
+- **File → Save Project…** で現在のプロジェクトを `.lmo` に保存します。初回は `NewProject.lmo`、以降は開いているプロジェクト名が入力されます。ダイアログで名前と保存先を変更できます。
+- **File → Load Project…** または `.lmo` のドラッグ＆ドロップで開きます。ライトレイヤー、HDR／EXR の画像データ、取り込んだ Alembic、カメラの画角と選択状態をファイル内に保存します。元の `.abc` や `.camera.json`、HDR／EXR が移動しても復元できます。
 
 ## HDR の編集と照明
 
-1. `Open Alembic…` でモデルとカメラを読み込みます。
+1. **Import Alembic…** でモデルとカメラを読み込みます。
 2. ライトレイヤーがゼロのときは **Default lighting** が自動でオンになり、内蔵のキーライトとベースの明るさでモデルを表示します。レイヤーがあるときは **Lighting** タブで設定できます。**HDR lighting** は環境光・映り込みをまとめて ON/OFF します。
 3. **HDR environment → + Add light → Shape → Image → Load HDR / EXR…** で、2:1 の全天球パノラマをレイヤーとして読み込みます。HDR/EXR をウィンドウにドロップしても Image レイヤーを追加できます。HDR キャンバスのダブルクリックでは丸形ライトを追加します。レイヤーを追加するたびに **Default lighting** が自動で OFF になります。
 4. キャンバスのライトをドラッグして移動します。ライトを選ぶと、色・強度・幅・高さ・減衰カーブ・経度・緯度を編集できます。ライトごとに ON/OFF、削除ができます。
@@ -66,42 +72,71 @@ Lighting の設定は `%LOCALAPPDATA%/HDR STUDIO/settings.json` に保存し、�
 
 影と反射のレイ追跡データは複数のテクスチャページに分けて GPU に送ります。扱えるシーンの大きさは GPU メモリ、テクスチャ配列の容量、PC のメモリに依存します。転送できない場合はステータス欄に原因を表示します。
 
-HDR/EXR は既定でリニア RGB として読み込みます。OCIO / ACES の変換は未対応で、EXR の負値は発光量として 0 にします。出力は合成済み HDR 画像です。ライトの編集状態を別プロジェクトとして保存する機能は未実装です。
+HDR/EXR は既定でリニア RGB として読み込みます。OCIO / ACES の変換は未対応で、EXR の負値は発光量として 0 にします。**Export HDR…** の出力は合成済み HDR 画像です。
 
 ## モデル上でライトを配置・移動する
 
 3D プレビュー上部の **Light placement** でモードを選び、モデルの表面をクリックするか、マウスの左ボタンを押したまま表面をドラッグします。
 
-- **Reflection** はその位置に映り込む方向にライトを配置します。
+- **Reflection** はその位置に映り込む方向にライトを配置します。初期モードです。
 - **Diffuse** はポインター位置の表面の法線に沿ってライトを配置します。
 
 有効なライトが選択されていれば移動し、選択がなければ新しく作成します。操作開始時に **Shift** を押していると新規ライトを1個追加します。ドラッグ中は HDR Canvas と 3D 照明が追従します。ポインターがモデルから外れると最後に当たった位置を保ちます。
+
+## Maya のシェルフに登録する
+
+Maya の Script Editor の **Python** タブで次を実行します。`HDRStudio` シェルフに **HDR STUDIO** ボタンが追加されます。旧ボタンを登録済みの場合は、Maya を起動し直して次を実行すると既存のボタンが更新されます。
+
+```python
+import sys
+sys.path.insert(0, r"C:/Users/55/Desktop/WORK/Programs/rust/HDR_STUDIO/scripts")
+import maya_hdr_studio
+maya_hdr_studio.install_shelf()
+```
+
+ボタンは登録時の `scripts` フォルダーにある `maya_hdr_studio.py` と `hdr_studio_maya.png` を参照します。フォルダーを移動した場合はパスを変更して登録し直します。
+
+## Maya の V-Ray Dome Light と同期する
+
+1. HDR STUDIO の **HDR environment → Link Maya V-Ray** を押すと、`%LOCALAPPDATA%\HDR STUDIO\vray-sync\hdr_studio_vray.hdr` に 700 × 350 px の同期用 HDR が作られます。
+2. 同じPC・同じWindowsユーザーで Maya を起動し、`HDRStudio` シェルフの **HDR STUDIO → V-Ray Sync → Start Sync** を押します。Maya は同期用の HDR を同じ場所から自動で参照します。
+3. Maya はシーン全体の V-Ray Dome Light を確認します。0灯なら `HDRStudioDome` を作り、1灯なら使用するか確認します。**Use Existing** を選ぶと既存の **Dome Tex** 接続を切り替え、**Use Dome Tex** と **Dome Spherical** を有効にします。**Cancel** を選ぶと同期開始を取り消します。2灯以上ある場合は警告を表示し、同期開始を取り消します。
+
+HDR STUDIO は編集操作中も全レイヤーの合成結果を同期用ファイルへ書き出します。**V-Ray HDR saved** の括弧内に保存回数を表示し、ファイルが一時的に使用中なら保存を再試行します。Maya は同じフォルダーで `*.maya-…-a.hdr` と `*.maya-…-b.hdr` を交互に更新し、保存完了後にドームのテクスチャパスを切り替えます。最後の HDR 更新から **Reload delay**（250〜2000 ms、初期値500 ms）で指定した時間が経過すると、File ノードの **Reload** を1回実行し、V-Ray IPR に再描画を要求します。スライダーは同期中も調整でき、待機中に調整すると新しい待ち時間でタイマーが始まります。
+
+**Sync now** で手動更新、**Stop V-Ray sync** で HDR STUDIO 側の書き出しを停止できます。Maya 側の再読み込みは **Stop Sync** で停止します。ウィンドウを閉じても再読み込みは続きます。同期を止めた後も、Maya のドームは最後に適用した HDR を参照します。Maya でシーンを開き直したら **Start Sync** を押し、HDR STUDIO を再起動したら **Link Maya V-Ray** を押します。
+
+### 仕上げ用 HDR を V-Ray に適用する
+
+HDR STUDIO の **HDR environment** で出力解像度を選び、**Render HDR for Maya…** を押して仕上げ用 `.hdr` の保存先を指定します。V-Ray の球面配置に合わせて保存し、完了後に Maya の Dome Light が指定先を直接参照します。編集中のプレビューに戻すときは **Resume Live Sync** を押します。
+
+同期専用ファイルは Maya の Y-up／V-Ray の球面配置に合わせた向きで保存します。既存ドームに独自のマッピング回転や Finite Dome の設定がある場合は、V-Ray 側の結果にもその設定が反映されます。通常の HDR は **Export HDR…** で書き出せます。
 
 ## Maya のレンダー画角を渡す
 
 **画角を合わせる場合は、付属の Maya スクリプトで `.abc` と `.camera.json` をセットで出力してください。** ABC 単体のプレビューはアーカイブのフィルムゲートとして扱い、Maya の最終レンダー画枠と一致するとは表示しません。
 
-Maya の Script Editor の Python タブで実行:
+`HDRStudio` シェルフの **HDR STUDIO → Alembic Export** を開きます。Outliner でモデルを選び、**Scope → Selected objects** と **Camera** を指定して **Export Alembic…** を押します。シーン全体のメッシュを対象にする場合は **Scene meshes** を選びます。**Renderable cameras** ではレンダリングが有効なカメラを出力します。
+
+Script Editor からも実行できます。
 
 ```python
 import sys
 sys.path.insert(0, r'C:/Users/55/Desktop/WORK/Programs/rust/HDR_STUDIO/scripts')
-import maya_export
-maya_export.export(r'C:/temp/lighting.abc', camera='renderCam')
+import maya_hdr_studio
+maya_hdr_studio.export(r'C:/temp/lighting.abc', camera='renderCam')
 ```
 
 `camera` にはカメラの Transform または Shape 名を指定します。同名が複数ある場合はフル DAG パスを使います。省略すると renderable なカメラを出力します。モデルはメッシュを含むルート階層を出力します。対象を絞る場合:
 
 ```python
-maya_export.export(r'C:/temp/lighting.abc', camera='|shot|renderCam', roots=['|product'])
+maya_hdr_studio.export(r'C:/temp/lighting.abc', camera='|shot|renderCam', roots=['|product'])
 ```
 
 選択したモデルだけを出力する場合は、Maya でモデルまたはグループを選択してから実行します。グループの子孫も含みます。未選択の兄弟モデルは含めず、指定カメラと必要な親 Transform は自動で追加します。実行後は元の選択を復元します。未選択時はエラーにします。
 
 ```python
-import importlib
-importlib.reload(maya_export)  # すでに読み込み済みの場合も変更を反映
-maya_export.export_selected(r'C:/temp/lighting.abc', camera='persp')
+maya_hdr_studio.export_selected(r'C:/temp/lighting.abc', camera='persp')
 ```
 
 現在のフレームだけを書き出します。Maya の内部単位（cm）を保持します。補助 JSON はレンダー解像度・ピクセルアスペクト・Maya API のレンダーフラスタム・ポスト投影変換・カメラのワールド逆行列を含みます。Film Fit、フィルムオフセット、レンズスクイーズ、フィルムロール、正投影を Rust 側で推測し直すことを避けます。
@@ -126,7 +161,7 @@ cargo run -- --inspect tests/output/maya_fit_0.abc
 - 凹形状を含む n-gon の三角形化。ABC に法線があれば保持し、省略されていれば共有頂点の周囲の面からスムース法線を生成。3D 表示と Reflection／Diffuse のライト配置に同じ法線を使用。
 - 静止サンプル表示。秒指定で再読み込み可能。アニメーションの補間・再生は未実装。
 - HDR/EXR の読み込み、HDR キャンバスでのソフトボックス編集、露出／回転、環境光と映り込みのプレビュー、HDR 書き出し。内蔵照明の ON/OFF。
-- 元のマテリアル・テクスチャ、Maya とのライブ接続は未実装。
+- Maya の V-Ray Dome Light への HDR 同期。元のマテリアル・テクスチャと Maya からのモデル・カメラのリアルタイム転送は未実装。
 - HDF5 の古い ABC、SubD の細分化、カーブ、ポイント、レンズ歪み、DOF、モーションブラーは未対応。非対応オブジェクトは Import notes に表示。
 - 任意のレンダラー／特殊なカメラプラグインまでの画角一致は未確認。Maya Software の参照画像による検証結果は `PROJECT_PROGRESS.md` に記録。
 
@@ -139,6 +174,8 @@ cargo run -- --inspect tests/output/maya_fit_0.abc
 - `src/renderer.rs`: GPU 描画と深度テスト。
 - `src/environment.rs`: HDR 画像、ライト合成、HDR 書き出し、環境光の SH 係数。
 - `src/hdr_editor.rs`: HDR 編集 UI とキャンバス、非同期読み込み／書き出し。
-- `scripts/maya_export.py`: Maya からの ABC とカメラ情報の出力。
+- `scripts/maya_hdr_studio.py`: Maya のシェルフ登録、Alembic とカメラの出力、V-Ray 用 HDR の同期。
+- `scripts/hdr_studio_maya.png`: Maya シェルフ用の 32 × 32 px PNG。
+- `src/vray_link.rs`: V-Ray 同期用 HDR の書き出し。
 # HDR_Studio
 # HDR_Studio

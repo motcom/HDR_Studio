@@ -5,9 +5,11 @@ mod environment;
 mod hdr_editor;
 mod light_paint;
 mod preview;
+mod project;
 mod renderer;
 mod scene;
 mod settings;
+mod vray_link;
 
 #[cfg(test)]
 mod tests;
@@ -55,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     eframe::run_native(
-        "HDR STUDIO — Lighting",
+        "HDR STUDIO — NewProject",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)?))),
     )?;

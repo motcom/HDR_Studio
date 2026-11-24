@@ -38,22 +38,30 @@ pub fn default_sample(path: &Path) -> Result<f64, String> {
 }
 
 pub fn load(path: &Path, seconds: f64) -> Result<Scene, String> {
-    let nodes = abc::load(path, seconds)?;
-    let mut scene = Scene {
-        path: path.into(),
-        nodes,
-        vertices: vec![],
-        pick_mesh: OnceLock::new(),
-        cameras: vec![],
-        warnings: vec![],
-        meshes: 0,
-    };
+    load_imported(path, path, seconds, None)
+}
+
+pub(crate) fn load_imported(
+    path: &Path,
+    archive: &Path,
+    seconds: f64,
+    original: Option<&std::fs::Metadata>,
+) -> Result<Scene, String> {
+    let nodes = abc::load(archive, seconds)?;
+    let mut cameras = Vec::new();
     let metadata_path = path.with_extension("camera.json");
     if metadata_path.exists() {
         let data = std::fs::read_to_string(&metadata_path).map_err(|e| e.to_string())?;
         let file: CameraFile =
             serde_json::from_str(&data).map_err(|e| format!("Camera JSON: {e}"))?;
-        let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        let fallback;
+        let metadata = match original {
+            Some(metadata) => metadata,
+            None => {
+                fallback = std::fs::metadata(path).map_err(|e| e.to_string())?;
+                &fallback
+            }
+        };
         let modified = metadata
             .modified()
             .map_err(|e| e.to_string())?
@@ -69,12 +77,36 @@ pub fn load(path: &Path, seconds: f64) -> Result<Scene, String> {
             return Err("Camera JSON is stale or for another sample. Re-export the ABC and camera JSON together.".into());
         }
         for c in file.cameras {
-            if !scene.nodes.iter().any(|n| n.kind == 3 && n.path == c.path) {
-                return Err(format!("Camera JSON path not present in ABC: {}", c.path));
-            }
-            scene.cameras.push(camera::from_record(&c)?);
+            cameras.push(camera::from_record(&c)?);
         }
     }
+    build_scene(path, nodes, cameras)
+}
+
+pub(crate) fn load_embedded(
+    name: &Path,
+    archive: &Path,
+    seconds: f64,
+    cameras: Vec<Camera>,
+) -> Result<Scene, String> {
+    build_scene(name, abc::load(archive, seconds)?, cameras)
+}
+
+fn build_scene(path: &Path, nodes: Vec<Node>, cameras: Vec<Camera>) -> Result<Scene, String> {
+    for c in &cameras {
+        if !nodes.iter().any(|n| n.kind == 3 && n.path == c.path) {
+            return Err(format!("Camera path not present in ABC: {}", c.path));
+        }
+    }
+    let mut scene = Scene {
+        path: path.into(),
+        nodes,
+        vertices: vec![],
+        pick_mesh: OnceLock::new(),
+        cameras,
+        warnings: vec![],
+        meshes: 0,
+    };
     for (index, node) in scene.nodes.iter().enumerate() {
         if node.parent < -1 || (node.parent >= 0 && node.parent as usize >= index) {
             return Err("Invalid scene parent hierarchy".into());

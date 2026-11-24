@@ -5,12 +5,12 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow"] }
-glam = "0.30"
+glam = { version = "0.30", features = ["serde"] }
 earcutr = "0.4"
 libloading = "0.8"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "hdr", "exr"] }
 glutin = { version = "0.32.3", default-features = false, features = ["wgl"] }

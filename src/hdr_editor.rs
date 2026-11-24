@@ -4,6 +4,7 @@ use crate::{
         LightMapping, LightShape, PREVIEW_HEIGHT, PREVIEW_WIDTH, panorama_rotation,
     },
     renderer::{Lighting, PREVIEW_SCALE_OPTIONS, SHADOW_SAMPLE_OPTIONS},
+    vray_link::VrayLink,
 };
 use eframe::egui;
 use std::{
@@ -744,6 +745,9 @@ impl CanvasDrag {
     }
 }
 
+pub(crate) const EXPORT_WIDTHS: [u32; 5] = [512, 1024, 2048, 4096, 8192];
+pub(crate) const DEFAULT_EXPORT_WIDTH: u32 = 2048;
+
 pub struct Editor {
     pub lighting: Lighting,
     document: Document,
@@ -766,6 +770,7 @@ pub struct Editor {
     discard_import: bool,
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     export_width: u32,
+    vray_link: VrayLink,
     canvas_drag: Option<CanvasDrag>,
     status: String,
     error: Option<String>,
@@ -794,7 +799,8 @@ impl Default for Editor {
             importing: None,
             discard_import: false,
             export: None,
-            export_width: 2048,
+            export_width: DEFAULT_EXPORT_WIDTH,
+            vray_link: VrayLink::default(),
             canvas_drag: None,
             status: String::new(),
             error: None,
@@ -802,6 +808,34 @@ impl Default for Editor {
     }
 }
 impl Editor {
+    pub(crate) fn project_document(&self) -> Document {
+        self.environment_snapshot()
+    }
+
+    pub(crate) fn project_export_width(&self) -> u32 {
+        self.export_width
+    }
+
+    pub(crate) fn is_importing(&self) -> bool {
+        self.importing.is_some()
+    }
+
+    pub(crate) fn replace_project(
+        &mut self,
+        document: Document,
+        lighting: Lighting,
+        export_width: u32,
+    ) {
+        let vray_link = std::mem::take(&mut self.vray_link);
+        *self = Self {
+            document,
+            lighting,
+            export_width,
+            vray_link,
+            ..Self::default()
+        };
+    }
+
     fn has_light_layers(&self) -> bool {
         !self.document.lights.is_empty() || !self.composite_parents.is_empty()
     }
@@ -901,8 +935,11 @@ impl Editor {
         } else {
             None
         };
-        let changed = self.lighting.default_light != before.default_light
-            || self.environment_snapshot() != before.document;
+        let document = self.environment_snapshot();
+        self.vray_link
+            .update(ctx, &document, self.importing.is_some());
+        let changed =
+            self.lighting.default_light != before.default_light || document != before.document;
         let same_group = group.is_some() && self.history.group == group;
         if changed {
             if !same_group {
@@ -1615,7 +1652,7 @@ impl Editor {
         egui::ComboBox::from_id_salt("hdr-output-size")
             .selected_text(format!("{} × {}", self.export_width, self.export_width / 2))
             .show_ui(ui, |ui| {
-                for width in [512, 1024, 2048, 4096, 8192] {
+                for width in EXPORT_WIDTHS {
                     ui.selectable_value(
                         &mut self.export_width,
                         width,
@@ -1625,7 +1662,7 @@ impl Editor {
             });
         if ui
             .add_enabled(
-                self.export.is_none() && self.importing.is_none(),
+                self.export.is_none() && self.importing.is_none() && !self.vray_link.is_rendering(),
                 egui::Button::new("Export HDR…"),
             )
             .clicked()
@@ -1656,6 +1693,11 @@ impl Editor {
                 ui.label("Exporting HDR…");
             });
         }
+        self.vray_link.controls(
+            ui,
+            self.export_width,
+            self.importing.is_some() || self.export.is_some(),
+        );
         if !self.status.is_empty() {
             ui.small(&self.status);
         }

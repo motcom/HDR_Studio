@@ -12,7 +12,7 @@ import maya.standalone
 maya.standalone.initialize(name='python')
 import maya.cmds as cmds
 sys.path.insert(0, str(ROOT/'scripts'))
-import maya_export
+import maya_hdr_studio
 
 try:
     cmds.file(new=True, force=True)
@@ -34,14 +34,14 @@ try:
     cmds.parent(extra, rig, relative=True)
     cmds.select(chosen, replace=True)
     before = cmds.ls(selection=True, long=True)
-    maya_export.export_selected(OUT/'maya_selected.abc', camera=camera)
+    maya_hdr_studio.export_selected(OUT/'maya_selected.abc', camera=camera)
     assert cmds.ls(selection=True, long=True) == before, 'Selection was not restored'
     cmds.select(group, replace=True)
-    maya_export.export_selected(OUT/'maya_selected_group.abc', camera=camera)
+    maya_hdr_studio.export_selected(OUT/'maya_selected_group.abc', camera=camera)
     assert cmds.ls(selection=True, long=True) == ['|sceneRoot|selectedGroup']
     cmds.select(clear=True)
     try:
-        maya_export.export_selected(OUT/'must_not_export.abc', camera=camera)
+        maya_hdr_studio.export_selected(OUT/'must_not_export.abc', camera=camera)
         raise AssertionError('Empty selection must fail')
     except ValueError:
         pass

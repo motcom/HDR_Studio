@@ -14,7 +14,7 @@ maya.standalone.initialize(name='python')
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 sys.path.insert(0, str(ROOT / 'scripts'))
-import maya_export
+import maya_hdr_studio
 
 try:
     cmds.file(new=True, force=True)
@@ -41,7 +41,7 @@ try:
         cmds.setAttr(shape+'.lensSqueezeRatio',1.2)
         cmds.setAttr(shape+'.filmRollValue', 7 if fit==3 else 0)
         path = OUT / ('maya_fit_{}.abc'.format(fit))
-        data = maya_export.export(path,camera=camera)
+        data = maya_hdr_studio.export(path,camera=camera)
         record=data['cameras'][0]
         # Independent Maya MPoint multiplication checks the Rust matrix layout/order.
         view=om.MMatrix(record['view'])
@@ -54,14 +54,14 @@ try:
     cmds.setAttr(shape+'.filmRollValue',0)
     cmds.setAttr(shape+'.orthographic',1)
     cmds.setAttr(shape+'.orthographicWidth',12)
-    data=maya_export.export(OUT/'maya_ortho.abc',camera=camera)
+    data=maya_hdr_studio.export(OUT/'maya_ortho.abc',camera=camera)
     record=data['cameras'][0]
     p=om.MMatrix(record['projection'])
     assert abs(p[15]-1)<1e-6, 'Orthographic projection must keep w=1'
     # Non-square pixels must affect the displayed gate, not the window size.
     cmds.setAttr(shape+'.orthographic',0)
     cmds.setAttr('defaultResolution.pixelAspect',1.5)
-    maya_export.export(OUT/'maya_pixel_aspect.abc',camera=camera)
+    maya_hdr_studio.export(OUT/'maya_pixel_aspect.abc',camera=camera)
     (OUT/'maya_reference.json').write_text(json.dumps(cases,indent=2),encoding='utf-8')
     # An actual Maya Software render is an independent oracle for image framing.
     cmds.delete(root)
@@ -90,7 +90,7 @@ try:
         cmds.setAttr(shape+'.filmFit',fit)
         cmds.setAttr(shape+'.filmRollValue',7 if fit==3 else 0)
         name='maya_marker_'+str(fit)
-        maya_export.export(OUT/(name+'.abc'),camera=camera)
+        maya_hdr_studio.export(OUT/(name+'.abc'),camera=camera)
         cmds.setAttr('defaultRenderGlobals.imageFilePrefix',name,type='string')
         rendered=cmds.render(camera,x=640,y=360)
         render_cases.append({'abc':name+'.abc','image':str(rendered),'positions':marker_positions})
@@ -111,6 +111,6 @@ try:
     hard = cmds.polySphere(name='hardSphere', subdivisionsX=16, subdivisionsY=12)[0]
     cmds.polySoftEdge(hard, angle=0, constructionHistory=False)
     cmds.setAttr(hard+'.translateX', 1.25)
-    maya_export.export(OUT/'maya_shading.abc', camera=camera)
+    maya_hdr_studio.export(OUT/'maya_shading.abc', camera=camera)
 finally:
     maya.standalone.uninitialize()

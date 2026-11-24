@@ -4,17 +4,29 @@ use crate::{
     hdr_editor::Editor,
     light_paint::LightPaint,
     preview::{Preview, Request},
-    scene::{self, Scene},
+    project::{self, Archive, LoadedModel, LoadedProject, ModelState, Snapshot, State},
+    scene::Scene,
     settings::Settings,
 };
 use eframe::egui;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::Instant,
 };
 
-type LoadResult = Result<(Scene, f64), String>;
+enum FileResult {
+    Imported(LoadedModel, f64),
+    Loaded(PathBuf, LoadedProject, f64),
+    Saved(PathBuf, Snapshot),
+}
+
+enum FileCommand {
+    New,
+    Save,
+    Load,
+    ReloadAlembic,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InspectorTab {
@@ -32,9 +44,14 @@ pub struct App {
     show_preview: bool,
     environment: Option<Arc<HdrImage>>,
     scene: Option<Arc<Scene>>,
-    loading: Option<mpsc::Receiver<LoadResult>>,
+    file_job: Option<mpsc::Receiver<Result<FileResult, String>>>,
+    loading_project: bool,
+    archive: Option<Arc<Archive>>,
+    project_path: Option<PathBuf>,
+    saved: Snapshot,
     camera: usize,
     seconds: f64,
+    applied_seconds: f64,
     error: Option<String>,
     elapsed: f64,
     initial: Option<PathBuf>,
@@ -54,14 +71,26 @@ impl App {
             editor.lighting = settings.lighting();
             editor.lighting.default_light = true;
         }
+        let saved = Snapshot {
+            state: State {
+                lighting: editor.lighting,
+                ..State::default()
+            },
+            model: None,
+        };
         Ok(Self {
             preview: Preview::new(&cc.egui_ctx)?,
             show_preview: true,
             environment: None,
             scene: None,
-            loading: None,
+            file_job: None,
+            loading_project: false,
+            archive: None,
+            project_path: None,
+            saved,
             camera: 0,
             seconds: 0.0,
+            applied_seconds: 0.0,
             error: None,
             elapsed: 0.0,
             initial,
@@ -73,27 +102,240 @@ impl App {
             placement_status: String::new(),
         })
     }
-    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
-        if self.scene.as_ref().is_none_or(|s| s.path != path) {
-            match scene::default_sample(&path) {
-                Ok(seconds) => self.seconds = seconds,
-                Err(e) => {
-                    self.error = Some(e);
-                    return;
-                }
-            }
-        }
+    fn run_file_job(
+        &mut self,
+        ctx: &egui::Context,
+        task: impl FnOnce() -> Result<FileResult, String> + Send + 'static,
+    ) {
         let (tx, rx) = mpsc::channel();
-        self.loading = Some(rx);
+        self.file_job = Some(rx);
         self.error = None;
-        let seconds = self.seconds;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let start = Instant::now();
-            let result = scene::load(&path, seconds).map(|s| (s, start.elapsed().as_secs_f64()));
-            let _ = tx.send(result);
+            let _ = tx.send(task());
             ctx.request_repaint();
         });
+    }
+
+    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if is_hdr(&path) {
+            self.editor.import(path, ctx);
+        } else if has_extension(&path, "lmo") {
+            if self.confirm_replace_project() {
+                self.load_project(path, ctx);
+            }
+        } else {
+            let sample = self.archive.as_ref().and_then(|archive| {
+                (archive.original.as_ref() == Some(&path)).then_some(self.seconds)
+            });
+            self.run_file_job(ctx, move || {
+                let start = Instant::now();
+                let model = Archive::import(&path, sample)?;
+                Ok(FileResult::Imported(model, start.elapsed().as_secs_f64()))
+            });
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let model = self
+            .archive
+            .as_ref()
+            .zip(self.scene.as_ref())
+            .map(|(archive, scene)| {
+                let state = ModelState {
+                    name: scene.path.file_name().unwrap_or_default().into(),
+                    seconds: self.applied_seconds,
+                    selected_camera: self.camera,
+                    cameras: scene.cameras.clone(),
+                };
+                (Arc::clone(archive), state)
+            });
+        Snapshot {
+            state: State {
+                document: self.editor.project_document(),
+                lighting: self.editor.lighting,
+                export_width: self.editor.project_export_width(),
+                show_preview: self.show_preview,
+                light_paint: self.light_paint,
+            },
+            model,
+        }
+    }
+
+    fn confirm_replace_project(&self) -> bool {
+        (self.snapshot() == self.saved && !self.editor.is_importing())
+            || rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Discard unsaved project changes?")
+                .set_description("Save the current project before replacing it if you want to keep these changes.")
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show() == rfd::MessageDialogResult::Yes
+    }
+
+    fn load_project(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.loading_project = true;
+        self.run_file_job(ctx, move || {
+            let start = Instant::now();
+            let project =
+                project::load(&path).map_err(|err| format!("Could not load project: {err}"))?;
+            Ok(FileResult::Loaded(
+                path,
+                project,
+                start.elapsed().as_secs_f64(),
+            ))
+        });
+    }
+
+    fn save_project(&mut self, ctx: &egui::Context) {
+        let file_name = self
+            .project_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str());
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("HDR STUDIO project", &["lmo"])
+            .set_file_name(file_name.unwrap_or("NewProject.lmo"));
+        if let Some(directory) = self.project_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if !has_extension(&path, "lmo") {
+            let Some(name) = path.file_name() else {
+                return;
+            };
+            let mut name = name.to_os_string();
+            name.push(".lmo");
+            path.set_file_name(name);
+            if path.exists()
+                && rfd::MessageDialog::new()
+                    .set_title("Replace existing project?")
+                    .set_description(path.display().to_string())
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    != rfd::MessageDialogResult::Yes
+            {
+                return;
+            }
+        }
+        let snapshot = self.snapshot();
+        self.run_file_job(ctx, move || {
+            project::save(&path, &snapshot)
+                .map_err(|err| format!("Could not save project: {err}"))?;
+            Ok(FileResult::Saved(path, snapshot))
+        });
+    }
+
+    fn set_project_path(&mut self, path: Option<PathBuf>, ctx: &egui::Context) {
+        self.project_path = path;
+        let stem = self.project_path.as_ref().and_then(|path| path.file_stem());
+        let title = stem.map_or_else(|| "NewProject".into(), |stem| stem.to_string_lossy());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "HDR STUDIO — {title}"
+        )));
+    }
+
+    fn apply_model(&mut self, model: Option<LoadedModel>, elapsed: f64) {
+        self.preview.suspend();
+        self.placement_status.clear();
+        self.light_stroke = None;
+        self.elapsed = elapsed;
+        if let Some(model) = model {
+            self.scene = Some(Arc::new(model.scene));
+            self.archive = Some(model.archive);
+            self.seconds = model.seconds;
+            self.applied_seconds = model.seconds;
+            self.camera = model.selected_camera;
+        } else {
+            self.scene = None;
+            self.archive = None;
+            self.seconds = 0.0;
+            self.applied_seconds = 0.0;
+            self.camera = 0;
+        }
+    }
+
+    fn apply_project(&mut self, project: LoadedProject, elapsed: f64) {
+        let State {
+            document,
+            lighting,
+            export_width,
+            show_preview,
+            light_paint,
+        } = project.state;
+        self.editor
+            .replace_project(document, lighting, export_width);
+        self.show_preview = show_preview;
+        self.editor.set_preview_visible(show_preview);
+        self.light_paint = light_paint;
+        self.environment = None;
+        self.apply_model(project.model, elapsed);
+        self.error = None;
+        self.saved = self.snapshot();
+    }
+
+    fn poll_file_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.file_job else {
+            return;
+        };
+        let result = match job.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("File operation stopped unexpectedly".into())
+            }
+        };
+        self.file_job = None;
+        self.loading_project = false;
+        match result {
+            Ok(FileResult::Imported(model, elapsed)) => self.apply_model(Some(model), elapsed),
+            Ok(FileResult::Loaded(path, project, elapsed)) => {
+                self.apply_project(project, elapsed);
+                self.set_project_path(Some(path), ctx);
+            }
+            Ok(FileResult::Saved(path, snapshot)) => {
+                self.saved = snapshot;
+                self.set_project_path(Some(path), ctx);
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn file_command(&mut self, command: FileCommand, ctx: &egui::Context) {
+        match command {
+            FileCommand::New if self.confirm_replace_project() => {
+                self.apply_project(
+                    LoadedProject {
+                        state: State::default(),
+                        model: None,
+                    },
+                    0.0,
+                );
+                self.set_project_path(None, ctx);
+            }
+            FileCommand::Save => self.save_project(ctx),
+            FileCommand::Load => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("HDR STUDIO project", &["lmo"])
+                    .pick_file()
+                    && self.confirm_replace_project()
+                {
+                    self.load_project(path, ctx);
+                }
+            }
+            FileCommand::ReloadAlembic => {
+                if let Some(archive) = self.archive.clone() {
+                    let seconds = self.seconds;
+                    self.run_file_job(ctx, move || {
+                        let start = Instant::now();
+                        let model = archive.reload(seconds)?;
+                        Ok(FileResult::Imported(model, start.elapsed().as_secs_f64()))
+                    });
+                }
+            }
+            FileCommand::New => {}
+        }
     }
 
     fn paint_light(
@@ -194,7 +436,7 @@ impl App {
 
     fn camera_controls(&mut self, ui: &mut egui::Ui) {
         let Some(scene) = &self.scene else {
-            ui.label("Open an .abc file containing polygon meshes and a camera.");
+            ui.label("Import an .abc file containing polygon meshes and a camera.");
             return;
         };
         let previous = self.camera;
@@ -239,46 +481,56 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_file_job(ctx);
+        if let Some(path) = self.initial.take() {
+            self.open(path, ctx);
+        }
+        if self.loading_project {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading project…");
+                });
+            });
+            return;
+        }
         let (before, restored) = self.editor.begin_edit_frame(ctx);
         if restored {
             self.light_stroke = None;
         }
         self.editor.poll();
-        if let Some(path) = self.initial.take() {
-            if is_hdr(&path) {
-                self.editor.import(path, ctx);
-            } else {
-                self.open(path, ctx);
-            }
-        }
-        if let Some(rx) = &self.loading {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.loading = None;
-                    match result {
-                        Ok((scene, elapsed)) => {
-                            self.light_stroke = None;
-                            self.camera = 0;
-                            self.elapsed = elapsed;
-                            self.scene = Some(Arc::new(scene));
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.loading = None;
-                    self.error = Some("ABC loading thread stopped unexpectedly".into());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
         let mut open_path = None;
+        let mut command = None;
+        let available = self.file_job.is_none();
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("HDR STUDIO");
                 ui.separator();
+                ui.add_enabled_ui(available, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("New Project").clicked() {
+                            command = Some(FileCommand::New);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.editor.is_importing(),
+                                egui::Button::new("Save Project…"),
+                            )
+                            .clicked()
+                        {
+                            command = Some(FileCommand::Save);
+                            ui.close();
+                        }
+                        if ui.button("Load Project…").clicked() {
+                            command = Some(FileCommand::Load);
+                            ui.close();
+                        }
+                    });
+                });
+                ui.separator();
                 if ui
-                    .add_enabled(self.loading.is_none(), egui::Button::new("Open Alembic…"))
+                    .add_enabled(available, egui::Button::new("Import Alembic…"))
                     .clicked()
                 {
                     open_path = rfd::FileDialog::new()
@@ -287,20 +539,20 @@ impl eframe::App for App {
                 }
                 if ui
                     .add_enabled(
-                        self.scene.is_some() && self.loading.is_none(),
+                        self.scene.is_some() && available,
                         egui::Button::new("Reload"),
                     )
                     .clicked()
                 {
-                    open_path = self.scene.as_ref().map(|s| s.path.clone());
+                    command = Some(FileCommand::ReloadAlembic);
                 }
                 ui.separator();
                 ui.label("Sample (seconds)");
                 ui.add_enabled(
-                    self.loading.is_none(),
+                    available,
                     egui::DragValue::new(&mut self.seconds).speed(0.01),
                 );
-                ui.label("applied on Open / Reload");
+                ui.label("applied on Import / Reload");
                 ui.separator();
                 if ui.checkbox(&mut self.show_preview, "3D Preview").changed() {
                     self.editor.set_preview_visible(self.show_preview);
@@ -311,9 +563,8 @@ impl eframe::App for App {
                         self.placement_status.clear();
                     }
                 }
-                if self.loading.is_some() {
+                if !available {
                     ui.spinner();
-                    ui.label("Loading…");
                 }
             });
         });
@@ -379,9 +630,6 @@ impl eframe::App for App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Light placement");
                     let mut changed = ui
-                        .selectable_value(&mut self.light_paint, LightPaint::Off, "Off")
-                        .changed();
-                    changed |= ui
                         .selectable_value(
                             &mut self.light_paint,
                             LightPaint::Reflection,
@@ -412,12 +660,10 @@ impl eframe::App for App {
                     };
                     let rect = egui::Rect::from_center_size(space.center(), size);
                     ui.allocate_rect(space, egui::Sense::hover());
-                    if self.light_paint != LightPaint::Off {
-                        let response = ui
-                            .interact(rect, ui.id().with("light-placement"), egui::Sense::click_and_drag())
-                            .on_hover_cursor(egui::CursorIcon::Crosshair);
-                        self.paint_light(ui, rect, response, &camera);
-                    }
+                    let response = ui
+                        .interact(rect, ui.id().with("light-placement"), egui::Sense::click_and_drag())
+                        .on_hover_cursor(egui::CursorIcon::Crosshair);
+                    self.paint_light(ui, rect, response, &camera);
                     ui.painter()
                         .rect_filled(rect, 0.0, egui::Color32::from_rgb(35, 40, 49));
                     if let Some(environment) = self.environment.clone() {
@@ -426,7 +672,7 @@ impl eframe::App for App {
                             camera: self.camera,
                             environment: Some(environment),
                             lighting: self.editor.lighting,
-                            needs_pick_mesh: self.light_paint != LightPaint::Off,
+                            needs_pick_mesh: true,
                             size: [0; 2],
                             refinement: 0,
                         });
@@ -445,20 +691,19 @@ impl eframe::App for App {
                 }
             });
         }
-        if self.loading.is_none()
+        if available
+            && command.is_none()
             && let Some(path) =
                 ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
         {
             open_path = Some(path);
         }
-        if let Some(path) = open_path {
-            if is_hdr(&path) {
-                self.editor.import(path, ctx);
-            } else {
-                self.open(path, ctx);
-            }
-        }
         self.editor.finish_edit_frame(ctx, before);
+        if let Some(command) = command {
+            self.file_command(command, ctx);
+        } else if let Some(path) = open_path {
+            self.open(path, ctx);
+        }
         if let Some(image) = self.editor.refresh(ctx) {
             self.environment = Some(image);
         }
@@ -476,8 +721,12 @@ impl eframe::App for App {
     }
 }
 
-fn is_hdr(path: &std::path::Path) -> bool {
+fn is_hdr(path: &Path) -> bool {
+    has_extension(path, "hdr") || has_extension(path, "exr")
+}
+
+fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension()
         .and_then(|v| v.to_str())
-        .is_some_and(|v| v.eq_ignore_ascii_case("hdr") || v.eq_ignore_ascii_case("exr"))
+        .is_some_and(|v| v.eq_ignore_ascii_case(extension))
 }
