@@ -1,6 +1,6 @@
 use crate::{
     camera::Camera,
-    environment::{Document, FalloffCurve, HdrImage},
+    environment::{Document, FalloffCurve, HdrImage, ImageSource},
     light_paint::LightPaint,
     renderer::Lighting,
     scene::{self, Scene},
@@ -27,6 +27,10 @@ pub struct State {
     pub export_width: u32,
     pub show_preview: bool,
     pub light_paint: LightPaint,
+    #[serde(default)]
+    pub retained_cameras: Vec<Camera>,
+    #[serde(default)]
+    pub retained_camera: usize,
 }
 
 impl Default for State {
@@ -37,6 +41,8 @@ impl Default for State {
             export_width: crate::hdr_editor::DEFAULT_EXPORT_WIDTH,
             show_preview: true,
             light_paint: LightPaint::default(),
+            retained_cameras: Vec::new(),
+            retained_camera: 0,
         }
     }
 }
@@ -47,6 +53,8 @@ pub struct ModelState {
     pub seconds: f64,
     pub selected_camera: usize,
     pub cameras: Vec<Camera>,
+    #[serde(default)]
+    pub removed_camera_paths: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -66,6 +74,7 @@ pub struct LoadedModel {
     pub archive: Arc<Archive>,
     pub seconds: f64,
     pub selected_camera: usize,
+    pub removed_camera_paths: Vec<String>,
 }
 
 pub struct LoadedProject {
@@ -97,6 +106,7 @@ impl Archive {
             }),
             seconds,
             selected_camera: 0,
+            removed_camera_paths: Vec::new(),
         })
     }
 
@@ -130,6 +140,7 @@ impl Archive {
             archive: self.clone(),
             seconds,
             selected_camera: 0,
+            removed_camera_paths: Vec::new(),
         })
     }
 }
@@ -181,6 +192,7 @@ pub fn load(path: &Path) -> Result<LoadedProject, String> {
             scene::load_embedded(&model.name, &file.0, model.seconds, model.cameras.clone())?;
         let seconds = model.seconds;
         let selected_camera = model.selected_camera;
+        let removed_camera_paths = model.removed_camera_paths.clone();
         Some(LoadedModel {
             scene,
             archive: Arc::new(Archive {
@@ -190,6 +202,7 @@ pub fn load(path: &Path) -> Result<LoadedProject, String> {
             }),
             seconds,
             selected_camera,
+            removed_camera_paths,
         })
     } else {
         None
@@ -221,10 +234,15 @@ fn read(path: &Path) -> io::Result<(Manifest, Option<TemporaryFile>)> {
     reader.read_exact(&mut metadata)?;
     let mut manifest: Manifest = serde_json::from_slice(&metadata)?;
     if manifest.model.is_some() != (abc_len > 0)
+        || (manifest.model.is_some() && !manifest.state.retained_cameras.is_empty())
         || !crate::hdr_editor::EXPORT_WIDTHS.contains(&manifest.state.export_width)
     {
         return Err(invalid("Invalid LMO project settings"));
     }
+    validate_cameras(
+        &manifest.state.retained_cameras,
+        manifest.state.retained_camera,
+    )?;
     if let Some(model) = &manifest.model {
         validate_model(model)?;
     }
@@ -246,10 +264,15 @@ fn read(path: &Path) -> io::Result<(Manifest, Option<TemporaryFile>)> {
 }
 
 fn validate_model(model: &ModelState) -> io::Result<()> {
-    if model.name.file_name() != Some(model.name.as_os_str())
-        || !model.seconds.is_finite()
-        || model.selected_camera >= model.cameras.len().max(1)
-        || model.cameras.iter().any(|camera| {
+    if model.name.file_name() != Some(model.name.as_os_str()) || !model.seconds.is_finite() {
+        return Err(invalid("Invalid model data in LMO"));
+    }
+    validate_cameras(&model.cameras, model.selected_camera)
+}
+
+fn validate_cameras(cameras: &[Camera], selected: usize) -> io::Result<()> {
+    if selected >= cameras.len().max(1)
+        || cameras.iter().any(|camera| {
             !camera.view.is_finite()
                 || !camera.projection.is_finite()
                 || !camera.aspect.is_finite()
@@ -264,7 +287,8 @@ fn validate_model(model: &ModelState) -> io::Result<()> {
 
 fn write_images(writer: &mut impl Write, document: &Document) -> io::Result<()> {
     for light in &document.lights {
-        if let Some(image) = &light.image_layer.image {
+        if let Some(source) = &light.image_layer.image {
+            let image = &source.original;
             writer.write_all(&image.width.to_le_bytes())?;
             writer.write_all(&image.height.to_le_bytes())?;
             writer.write_all(bytemuck::cast_slice(&image.pixels))?;
@@ -283,11 +307,30 @@ fn read_images(reader: &mut Take<impl Read>, document: &mut Document) -> io::Res
         return Err(invalid("Invalid light IDs in LMO"));
     }
     for light in &mut document.lights {
-        for curve in [&light.falloff, &light.gradient_curve]
-            .into_iter()
-            .chain(&light.box_vertical)
+        for curve in [
+            &light.falloff,
+            &light.gradient_curve,
+            &light.gradient_background.value,
+            &light.gradient_background.alpha,
+        ]
+        .into_iter()
+        .chain(&light.box_vertical)
         {
             validate_curve(curve)?;
+        }
+        let stops = &light.gradient_background.colors;
+        if !(2..=crate::environment::MAX_COLOR_STOPS).contains(&stops.len())
+            || stops[0].position != 0.0
+            || stops[stops.len() - 1].position != 1.0
+            || stops.windows(2).any(|pair| {
+                pair[0].position.partial_cmp(&pair[1].position) != Some(std::cmp::Ordering::Less)
+            })
+            || stops
+                .iter()
+                .flat_map(|stop| stop.color)
+                .any(|channel| !(0.0..=1.0).contains(&channel))
+        {
+            return Err(invalid("Invalid gradient background color ramp in LMO"));
         }
         let width = u32::from_le_bytes(read_bytes(reader)?);
         let height = u32::from_le_bytes(read_bytes(reader)?);
@@ -308,7 +351,7 @@ fn read_images(reader: &mut Take<impl Read>, document: &mut Document) -> io::Res
             {
                 return Err(invalid("Invalid HDR radiance in LMO"));
             }
-            light.image_layer.image = Some(Arc::new(HdrImage {
+            light.image_layer.image = Some(ImageSource::shared(HdrImage {
                 width,
                 height,
                 pixels,
@@ -391,12 +434,13 @@ mod tests {
         };
         state.lighting.default_light = false;
         state.lighting.roughness = 0.37;
-        state.document.rotation = 13.0;
+        state.lighting.canvas_exposure_ev = -2.0;
+        state.lighting.render_preview_exposure_ev = 1.5;
         let mut children = Document::default();
         let image = children.add_light();
         children.lights[image].shape = LightShape::Image;
         children.lights[image].image_layer.source = "offline.exr".into();
-        children.lights[image].image_layer.image = Some(Arc::new(HdrImage {
+        children.lights[image].image_layer.image = Some(ImageSource::shared(HdrImage {
             width: 2,
             height: 1,
             pixels: vec![[7.125, 0.25, 0.0], [0.5, 1.5, 3.0]],
@@ -406,6 +450,12 @@ mod tests {
         state.document.lights[group].shape = LightShape::CompositeLight;
         state.document.lights[group].blend = BlendMode::Over;
         state.document.lights[group].composite = Some(Box::new(children));
+        let background = state.document.add_light();
+        let gradient = &mut state.document.lights[background];
+        gradient.shape = LightShape::GradientBackground;
+        gradient.gradient_background.colors[0].color = [0.25, 0.5, 1.0];
+        gradient.gradient_background.alpha =
+            FalloffCurve::from_preset(crate::environment::FalloffPreset::Linear);
         let mut cameras = imported.scene.cameras.clone();
         cameras[0].projection.z_axis.x += 0.000_123_456_789_012_345;
         cameras[0].source = "Saved render gate".into();
@@ -418,6 +468,7 @@ mod tests {
                     seconds: 0.0,
                     selected_camera: 0,
                     cameras: cameras.clone(),
+                    removed_camera_paths: vec![cameras[0].path.clone()],
                 },
             )),
         };
@@ -435,6 +486,7 @@ mod tests {
             scene::bounds(&imported.scene.vertices)
         );
         assert!(model.scene.cameras == cameras);
+        assert_eq!(model.removed_camera_paths, [cameras[0].path.clone()]);
         assert_eq!(model.selected_camera, 0);
         assert_eq!(loaded.state.export_width, 4096);
         assert!(loaded.state.light_paint == LightPaint::Diffuse);
@@ -452,6 +504,22 @@ mod tests {
             snapshot.state.document.compose(24, 12).pixels
         );
         assert!(model.archive.reload(0.0).unwrap().scene.cameras == cameras);
+
+        let camera_only = Snapshot {
+            state: State {
+                retained_cameras: cameras,
+                ..snapshot.state
+            },
+            model: None,
+        };
+        save(&file.0, &camera_only).unwrap();
+        let loaded = load(&file.0).unwrap();
+        assert!(loaded.model.is_none());
+        assert!(loaded.state.retained_cameras == camera_only.state.retained_cameras);
+        assert_eq!(
+            loaded.state.document.compose(24, 12).pixels,
+            camera_only.state.document.compose(24, 12).pixels
+        );
     }
 
     #[test]

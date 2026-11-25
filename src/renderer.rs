@@ -27,6 +27,8 @@ pub struct Renderer {
 #[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Lighting {
+    pub canvas_exposure_ev: f32,
+    pub render_preview_exposure_ev: f32,
     pub default_light: bool,
     pub environment: bool,
     pub background: bool,
@@ -43,6 +45,8 @@ pub struct Lighting {
 impl Default for Lighting {
     fn default() -> Self {
         Self {
+            canvas_exposure_ev: 0.0,
+            render_preview_exposure_ev: 0.0,
             default_light: true,
             environment: true,
             background: true,
@@ -356,6 +360,7 @@ impl Renderer {
     }
 
     pub fn paint(&self, gl: &glow::Context, camera: &Camera, lighting: Lighting) {
+        let display_gain = 2.0_f32.powf(lighting.render_preview_exposure_ev.clamp(-10.0, 10.0));
         unsafe {
             // The offscreen viewport supplies depth; scissor bounds each render band.
             gl.disable(glow::CULL_FACE);
@@ -375,6 +380,11 @@ impl Renderer {
                 gl.disable(glow::DEPTH_TEST);
                 gl.depth_mask(false);
                 gl.use_program(Some(self.background_program));
+                gl.uniform_1_f32(
+                    gl.get_uniform_location(self.background_program, "display_gain")
+                        .as_ref(),
+                    display_gain,
+                );
                 let inverse = (camera.projection * camera.view)
                     .inverse()
                     .as_mat4()
@@ -420,6 +430,11 @@ impl Renderer {
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::BLEND);
             gl.use_program(Some(self.program));
+            gl.uniform_1_f32(
+                gl.get_uniform_location(self.program, "display_gain")
+                    .as_ref(),
+                display_gain,
+            );
             gl.bind_vertex_array(Some(self.vao));
             let projection = camera.projection.as_mat4().to_cols_array();
             let view = camera.view.as_mat4().to_cols_array();
@@ -545,12 +560,13 @@ void main() {
 "#;
 const COMMON: &str = r#"#version 330 core
 uniform sampler2D environment_map;
+uniform float display_gain;
 const float PI = 3.141592653589793;
 vec2 env_uv(vec3 d) {
     return vec2(atan(d.z,d.x)/(2.0*PI)+0.5,acos(clamp(d.y,-1.0,1.0))/PI);
 }
 vec3 display_color(vec3 c) {
-    c=max(c,vec3(0.0));c=c/(1.0+c);
+    c=max(c*display_gain,vec3(0.0));c=c/(1.0+c);
     return mix(12.92*c,1.055*pow(c,vec3(1.0/2.4))-0.055,step(vec3(0.0031308),c));
 }
 "#;

@@ -5,6 +5,7 @@ use crate::{
     light_paint::LightPaint,
     preview::{Preview, Request},
     project::{self, Archive, LoadedModel, LoadedProject, ModelState, Snapshot, State},
+    renderer::Lighting,
     scene::Scene,
     settings::Settings,
 };
@@ -26,6 +27,8 @@ enum FileCommand {
     Save,
     Load,
     ReloadAlembic,
+    RemoveModels,
+    RemoveCamera,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,7 @@ enum InspectorTab {
     Lighting,
     FixedCamera,
     HdrEnvironment,
+    File,
 }
 
 struct LightStroke {
@@ -50,6 +54,8 @@ pub struct App {
     project_path: Option<PathBuf>,
     saved: Snapshot,
     camera: usize,
+    retained_cameras: Vec<Camera>,
+    removed_camera_paths: Vec<String>,
     seconds: f64,
     applied_seconds: f64,
     error: Option<String>,
@@ -89,6 +95,8 @@ impl App {
             project_path: None,
             saved,
             camera: 0,
+            retained_cameras: Vec::new(),
+            removed_camera_paths: Vec::new(),
             seconds: 0.0,
             applied_seconds: 0.0,
             error: None,
@@ -147,6 +155,7 @@ impl App {
                     seconds: self.applied_seconds,
                     selected_camera: self.camera,
                     cameras: scene.cameras.clone(),
+                    removed_camera_paths: self.removed_camera_paths.clone(),
                 };
                 (Arc::clone(archive), state)
             });
@@ -157,6 +166,8 @@ impl App {
                 export_width: self.editor.project_export_width(),
                 show_preview: self.show_preview,
                 light_paint: self.light_paint,
+                retained_cameras: self.retained_cameras.clone(),
+                retained_camera: if model.is_none() { self.camera } else { 0 },
             },
             model,
         }
@@ -237,23 +248,82 @@ impl App {
     }
 
     fn apply_model(&mut self, model: Option<LoadedModel>, elapsed: f64) {
-        self.preview.suspend();
-        self.placement_status.clear();
-        self.light_stroke = None;
+        self.invalidate_scene_preview();
         self.elapsed = elapsed;
+        self.retained_cameras.clear();
         if let Some(model) = model {
             self.scene = Some(Arc::new(model.scene));
             self.archive = Some(model.archive);
             self.seconds = model.seconds;
             self.applied_seconds = model.seconds;
             self.camera = model.selected_camera;
+            self.removed_camera_paths = model.removed_camera_paths;
         } else {
             self.scene = None;
             self.archive = None;
             self.seconds = 0.0;
             self.applied_seconds = 0.0;
             self.camera = 0;
+            self.removed_camera_paths.clear();
         }
+    }
+
+    fn invalidate_scene_preview(&mut self) {
+        self.preview.suspend();
+        self.placement_status.clear();
+        self.light_stroke = None;
+    }
+
+    fn cameras(&self) -> &[Camera] {
+        self.scene
+            .as_ref()
+            .map_or(&self.retained_cameras, |scene| &scene.cameras)
+    }
+
+    fn selected_camera(&self) -> Option<&Camera> {
+        self.cameras()
+            .get(self.camera)
+            .filter(|camera| !self.removed_camera_paths.contains(&camera.path))
+    }
+
+    fn remove_models(&mut self) {
+        let selected = self.selected_camera().map(|camera| camera.path.clone());
+        let cameras: Vec<_> = self
+            .cameras()
+            .iter()
+            .filter(|camera| !self.removed_camera_paths.contains(&camera.path))
+            .cloned()
+            .collect();
+        self.apply_model(None, 0.0);
+        self.camera = cameras
+            .iter()
+            .position(|camera| Some(&camera.path) == selected.as_ref())
+            .unwrap_or(0);
+        self.retained_cameras = cameras;
+    }
+
+    fn remove_camera(&mut self) {
+        let Some(camera) = self.selected_camera() else {
+            return;
+        };
+        if self.scene.is_some() {
+            self.removed_camera_paths.push(camera.path.clone());
+            self.camera = self
+                .cameras()
+                .iter()
+                .enumerate()
+                .cycle()
+                .skip(self.camera + 1)
+                .take(self.cameras().len())
+                .find(|(_, camera)| !self.removed_camera_paths.contains(&camera.path))
+                .map_or(0, |(index, _)| index);
+        } else {
+            self.retained_cameras.remove(self.camera);
+            self.camera = self
+                .camera
+                .min(self.retained_cameras.len().saturating_sub(1));
+        }
+        self.invalidate_scene_preview();
     }
 
     fn apply_project(&mut self, project: LoadedProject, elapsed: f64) {
@@ -263,6 +333,8 @@ impl App {
             export_width,
             show_preview,
             light_paint,
+            retained_cameras,
+            retained_camera,
         } = project.state;
         self.editor
             .replace_project(document, lighting, export_width);
@@ -271,6 +343,10 @@ impl App {
         self.light_paint = light_paint;
         self.environment = None;
         self.apply_model(project.model, elapsed);
+        if self.scene.is_none() {
+            self.retained_cameras = retained_cameras;
+            self.camera = retained_camera;
+        }
         self.error = None;
         self.saved = self.snapshot();
     }
@@ -327,13 +403,28 @@ impl App {
             FileCommand::ReloadAlembic => {
                 if let Some(archive) = self.archive.clone() {
                     let seconds = self.seconds;
+                    let removed_camera_paths = self.removed_camera_paths.clone();
+                    let selected_path = self.selected_camera().map(|camera| camera.path.clone());
                     self.run_file_job(ctx, move || {
                         let start = Instant::now();
-                        let model = archive.reload(seconds)?;
+                        let mut model = archive.reload(seconds)?;
+                        let cameras = &model.scene.cameras;
+                        model.selected_camera = cameras
+                            .iter()
+                            .position(|camera| Some(&camera.path) == selected_path.as_ref())
+                            .or_else(|| {
+                                cameras
+                                    .iter()
+                                    .position(|camera| !removed_camera_paths.contains(&camera.path))
+                            })
+                            .unwrap_or(0);
+                        model.removed_camera_paths = removed_camera_paths;
                         Ok(FileResult::Imported(model, start.elapsed().as_secs_f64()))
                     });
                 }
             }
+            FileCommand::RemoveModels => self.remove_models(),
+            FileCommand::RemoveCamera => self.remove_camera(),
             FileCommand::New => {}
         }
     }
@@ -435,33 +526,39 @@ impl App {
     }
 
     fn camera_controls(&mut self, ui: &mut egui::Ui) {
-        let Some(scene) = &self.scene else {
+        if self.scene.is_none() && self.retained_cameras.is_empty() {
             ui.label("Import an .abc file containing polygon meshes and a camera.");
             return;
-        };
+        }
         let previous = self.camera;
+        let mut selected = self.camera;
         egui::ComboBox::from_id_salt("camera")
             .selected_text(
-                scene
-                    .cameras
-                    .get(self.camera)
+                self.selected_camera()
                     .map_or("No camera", |c| c.path.as_str()),
             )
             .show_ui(ui, |ui| {
-                for (index, camera) in scene.cameras.iter().enumerate() {
-                    ui.selectable_value(&mut self.camera, index, &camera.path);
+                for (index, camera) in self.cameras().iter().enumerate() {
+                    if !self.removed_camera_paths.contains(&camera.path) {
+                        ui.selectable_value(&mut selected, index, &camera.path);
+                    }
                 }
             });
+        self.camera = selected;
         if self.camera != previous {
             self.light_stroke = None;
         }
-        if let Some(camera) = scene.cameras.get(self.camera) {
+        if let Some(camera) = self.selected_camera() {
             ui.label(format!(
                 "{:.2} mm · aspect {:.6}",
                 camera.focal, camera.aspect
             ));
             ui.small(&camera.source);
         }
+        let Some(scene) = &self.scene else {
+            ui.small("No models loaded.");
+            return;
+        };
         ui.separator();
         ui.label(scene.path.file_name().unwrap_or_default().to_string_lossy());
         ui.label(format!(
@@ -580,6 +677,7 @@ impl eframe::App for App {
                         (InspectorTab::Lighting, "Lighting"),
                         (InspectorTab::FixedCamera, "Fixed camera"),
                         (InspectorTab::HdrEnvironment, "HDR environment"),
+                        (InspectorTab::File, "File"),
                     ] {
                         ui.selectable_value(&mut self.inspector_tab, tab, label);
                     }
@@ -602,6 +700,22 @@ impl eframe::App for App {
                         }
                         InspectorTab::FixedCamera => self.camera_controls(ui),
                         InspectorTab::HdrEnvironment => self.editor.environment_controls(ui),
+                        InspectorTab::File => {
+                            let size = egui::vec2(ui.available_width(), 28.0);
+                            self.editor.file_controls(ui, size);
+                            ui.separator();
+                            ui.strong("Scene");
+                            if ui.add_enabled(available && self.scene.is_some(),
+                                egui::Button::new("Remove All Models").min_size(size)).clicked()
+                            {
+                                command = Some(FileCommand::RemoveModels);
+                            }
+                            if ui.add_enabled(available && self.selected_camera().is_some(),
+                                egui::Button::new("Remove Selected Camera").min_size(size)).clicked()
+                            {
+                                command = Some(FileCommand::RemoveCamera);
+                            }
+                        }
                     });
             });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -622,11 +736,7 @@ impl eframe::App for App {
             egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(14, 17, 22)))
             .show(ctx, |ui| {
-                let camera: Option<Camera> = self
-                    .scene
-                    .as_ref()
-                    .and_then(|s| s.cameras.get(self.camera))
-                    .cloned();
+                let camera = self.selected_camera().cloned();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Light placement");
                     let mut changed = ui
@@ -671,7 +781,7 @@ impl eframe::App for App {
                             scene,
                             camera: self.camera,
                             environment: Some(environment),
-                            lighting: self.editor.lighting,
+                            lighting: Lighting { canvas_exposure_ev: 0.0, ..self.editor.lighting },
                             needs_pick_mesh: true,
                             size: [0; 2],
                             refinement: 0,
@@ -686,7 +796,11 @@ impl eframe::App for App {
                 } else {
                     self.light_stroke = None;
                     ui.centered_and_justified(|ui| {
-                        ui.label("Import a camera to preview its framing.");
+                        ui.label(if self.scene.is_none() {
+                            "Import an Alembic model to preview the scene."
+                        } else {
+                            "Import a camera to preview its framing."
+                        });
                     });
                 }
             });

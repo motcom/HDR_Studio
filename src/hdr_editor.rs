@@ -1,7 +1,8 @@
 use crate::{
     environment::{
-        BlendMode, BoxInterpolation, Document, FalloffCurve, FalloffPreset, HdrImage, Light,
-        LightMapping, LightShape, PREVIEW_HEIGHT, PREVIEW_WIDTH, panorama_rotation,
+        BlendMode, BoxInterpolation, ColorStop, Document, FalloffCurve, FalloffPreset,
+        GradientBackground, HdrImage, ImageSource, Light, LightMapping, LightShape,
+        MAX_COLOR_STOPS, PREVIEW_HEIGHT, PREVIEW_WIDTH, panorama_rotation,
     },
     renderer::{Lighting, PREVIEW_SCALE_OPTIONS, SHADOW_SAMPLE_OPTIONS},
     vray_link::VrayLink,
@@ -207,6 +208,86 @@ fn rotation_dial(ui: &mut egui::Ui, angle: &mut f32, hint: &str) -> bool {
     changed
 }
 
+fn background_color_controls(ui: &mut egui::Ui, ramp: &mut GradientBackground) -> bool {
+    const MIN_SPACING: f32 = 0.001;
+    let mut changed = false;
+    let mut remove = None;
+    let (bar, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
+    for step in 0..64 {
+        let left = step as f32 / 64.0;
+        let right = (step + 1) as f32 / 64.0;
+        let [r, g, b] = ramp.color_at((left + right) * 0.5).to_array();
+        let rect = egui::Rect::from_x_y_ranges(
+            egui::lerp(bar.x_range(), left)..=egui::lerp(bar.x_range(), right),
+            bar.y_range(),
+        );
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            egui::Color32::from(egui::Rgba::from_rgb(r, g, b)),
+        );
+    }
+    for index in 0..ramp.colors.len() {
+        let last = ramp.colors.len() - 1;
+        let range = (index > 0 && index < last).then(|| {
+            ramp.colors[index - 1].position + MIN_SPACING
+                ..=ramp.colors[index + 1].position - MIN_SPACING
+        });
+        let stop = &mut ramp.colors[index];
+        ui.push_id(index, |ui| {
+            ui.horizontal(|ui| {
+                changed |= ui.color_edit_button_rgb(&mut stop.color).changed();
+                if let Some(range) = range {
+                    let mut percent = stop.position * 100.0;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut percent)
+                                .range(range.start() * 100.0..=range.end() * 100.0)
+                                .speed(0.25)
+                                .max_decimals(2)
+                                .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        stop.position = percent / 100.0;
+                        changed = true;
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                } else {
+                    ui.label(if index == 0 {
+                        "Top · 0%"
+                    } else {
+                        "Bottom · 100%"
+                    });
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        ramp.colors.remove(index);
+        changed = true;
+    }
+    if ui
+        .add_enabled(
+            ramp.colors.len() < MAX_COLOR_STOPS,
+            egui::Button::new("+ Add color stop"),
+        )
+        .clicked()
+        && let Some((index, pair)) = ramp.colors.windows(2).enumerate().max_by(|(_, a), (_, b)| {
+            (a[1].position - a[0].position).total_cmp(&(b[1].position - b[0].position))
+        })
+    {
+        let position = (pair[0].position + pair[1].position) * 0.5;
+        let color = ramp.color_at(position).to_array();
+        ramp.colors.insert(index + 1, ColorStop { position, color });
+        changed = true;
+    }
+    changed
+}
+
 fn rotation_control(ui: &mut egui::Ui, label: &str, angle: &mut f32, hint: &str) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -354,6 +435,16 @@ fn shape_icon(ui: &mut egui::Ui, shape: LightShape) {
                 painter.rect_filled(bar, 0.5, color);
             }
         }
+        LightShape::GradientBackground => {
+            outline(icon);
+            for (offset, opacity) in [(3.0, 225), (6.0, 155), (9.0, 85)] {
+                painter.hline(
+                    icon.shrink(2.0).x_range(),
+                    icon.top() + offset,
+                    egui::Stroke::new(1.5_f32, color.gamma_multiply(opacity as f32 / 255.0)),
+                );
+            }
+        }
         LightShape::Image => {
             outline(icon);
             painter.line(
@@ -382,7 +473,7 @@ fn shape_picker(ui: &mut egui::Ui, light: &mut Light) -> bool {
         ui.label("Shape");
         shape_icon(ui, light.shape);
         egui::ComboBox::from_id_salt("light-shape")
-            .width(115.0)
+            .width(148.0)
             .selected_text(light.shape.label())
             .show_ui(ui, |ui| {
                 for shape in LightShape::ALL {
@@ -525,7 +616,6 @@ fn draw_light_guide(
     painter: &egui::Painter,
     rect: egui::Rect,
     light: &Light,
-    rotation: f32,
     selected: bool,
     stroke: egui::Stroke,
 ) {
@@ -534,7 +624,7 @@ fn draw_light_guide(
         |uv: glam::Vec2| rect.min + egui::vec2(uv.x * rect.width(), uv.y * rect.height());
     let to_map = |point| {
         let mut uv = projection.panorama(point);
-        uv.x = canvas_u(uv.x + rotation);
+        uv.x = canvas_u(uv.x);
         uv
     };
     let draw_curve = |points: &mut dyn Iterator<Item = glam::Vec2>| {
@@ -575,7 +665,7 @@ fn draw_light_guide(
                 }),
             );
         }
-        LightShape::Image | LightShape::CompositeLight => return,
+        _ => return,
     }
     if selected {
         let core = to_map(if light.shape == LightShape::Gradient {
@@ -596,13 +686,8 @@ fn draw_light_guide(
     }
 }
 
-fn draw_composite_handle(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    position: glam::Vec2,
-    rotation: f32,
-) {
-    let u = canvas_u(position.x + rotation);
+fn draw_composite_handle(painter: &egui::Painter, rect: egui::Rect, position: glam::Vec2) {
+    let u = canvas_u(position.x);
     let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 194, 77));
     for u in [u - 1.0, u, u + 1.0] {
         let center = rect.min + egui::vec2(u * rect.width(), position.y * rect.height());
@@ -641,8 +726,29 @@ pub(crate) struct EditSnapshot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditGroup {
     Pointer,
-    Nudge,
+    Nudge(NudgeMode),
     Text(egui::Id),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NudgeMode {
+    Position,
+    Size,
+    Intensity,
+}
+
+impl NudgeMode {
+    fn from_modifiers(modifiers: egui::Modifiers) -> Option<Self> {
+        if modifiers.is_none() {
+            Some(Self::Position)
+        } else if modifiers.matches_exact(egui::Modifiers::SHIFT) {
+            Some(Self::Size)
+        } else if modifiers.matches_exact(egui::Modifiers::CTRL) {
+            Some(Self::Intensity)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -663,6 +769,16 @@ const ARROW_KEYS: [egui::Key; 4] = [
     egui::Key::ArrowUp,
     egui::Key::ArrowDown,
 ];
+const WIDTH_RANGE: std::ops::RangeInclusive<f32> = 1.0..=180.0;
+const HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 1.0..=90.0;
+const INTENSITY_RANGE: std::ops::RangeInclusive<f32> = 0.0..=10000.0;
+
+fn nudge_value(value: &mut f32, delta: f32, range: std::ops::RangeInclusive<f32>) -> bool {
+    delta != 0.0 && {
+        let next = (*value + delta).clamp(*range.start(), *range.end());
+        std::mem::replace(value, next) != next
+    }
+}
 
 fn solo_document(mut document: Document, solo: Option<u32>) -> Document {
     if let Some(id) = solo {
@@ -759,13 +875,15 @@ pub struct Editor {
     preview_job: Option<mpsc::Receiver<PreviewImages>>,
     preview_visible: Arc<AtomicBool>,
     canvas_revision: u64,
+    canvas_image: Option<Arc<HdrImage>>,
+    displayed_canvas_ev: Option<f32>,
     texture: Option<egui::TextureHandle>,
     canvas_view: CanvasView,
     show_lat_long_guide: bool,
     falloff_texture: Option<(usize, egui::TextureHandle)>,
     falloff_stale: bool,
-    import: mpsc::Receiver<Result<(HdrImage, String), String>>,
-    import_tx: mpsc::Sender<Result<(HdrImage, String), String>>,
+    import: mpsc::Receiver<Result<(Arc<ImageSource>, String), String>>,
+    import_tx: mpsc::Sender<Result<(Arc<ImageSource>, String), String>>,
     importing: Option<u32>,
     discard_import: bool,
     export: Option<mpsc::Receiver<Result<PathBuf, String>>>,
@@ -789,6 +907,8 @@ impl Default for Editor {
             preview_job: None,
             preview_visible: Arc::new(AtomicBool::new(true)),
             canvas_revision: 0,
+            canvas_image: None,
+            displayed_canvas_ev: None,
             texture: None,
             canvas_view: CanvasView::Hdr,
             show_lat_long_guide: true,
@@ -918,12 +1038,13 @@ impl Editor {
     }
 
     pub(crate) fn finish_edit_frame(&mut self, ctx: &egui::Context, before: EditSnapshot) {
-        let (pointer, released, arrows, arrow_released) = ctx.input(|i| {
+        let (pointer, released, arrows, arrow_released, nudge_mode) = ctx.input(|i| {
             (
                 i.pointer.primary_down(),
                 i.pointer.button_released(egui::PointerButton::Primary),
                 ARROW_KEYS.iter().any(|&key| i.key_down(key)),
                 ARROW_KEYS.iter().any(|&key| i.key_released(key)),
+                NudgeMode::from_modifiers(i.modifiers),
             )
         });
         let group = if pointer || released {
@@ -931,7 +1052,7 @@ impl Editor {
         } else if let Some(id) = text_focus(ctx) {
             Some(EditGroup::Text(id))
         } else if arrows || arrow_released {
-            Some(EditGroup::Nudge)
+            nudge_mode.map(EditGroup::Nudge)
         } else {
             None
         };
@@ -949,7 +1070,7 @@ impl Editor {
         }
         self.history.group = match group {
             Some(EditGroup::Pointer) if !pointer => None,
-            Some(EditGroup::Nudge) if !arrows => None,
+            Some(EditGroup::Nudge(_)) if !arrows => None,
             group => group.filter(|_| changed || same_group),
         };
     }
@@ -959,38 +1080,82 @@ impl Editor {
         if light.locked {
             return;
         }
-        let (delete, arrows) = ctx.input_mut(|i| {
-            if !i.modifiers.is_none() {
-                return (false, [false; 4]);
-            }
-            let delete_pressed = i.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Delete,
-                        pressed: true,
-                        repeat: false,
-                        ..
-                    }
-                )
+        let delete = ctx.input_mut(|input| {
+            let mut delete = false;
+            input.events.retain(|event| {
+                if let egui::Event::Key {
+                    key: egui::Key::Delete,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                    && modifiers.is_none()
+                {
+                    delete |= !repeat;
+                    return false;
+                }
+                true
             });
-            let delete = i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) && delete_pressed;
-            let arrows = ARROW_KEYS.map(|key| i.consume_key(egui::Modifiers::NONE, key));
-            (delete, arrows)
+            delete
         });
         if delete {
             self.delete_layer(index);
-        } else if arrows.iter().any(|&pressed| pressed) && light.shape != LightShape::Image {
-            let [left, right, up, down] = arrows.map(|pressed| if pressed { 1.0 } else { 0.0 });
-            let light = &mut self.document.lights[index];
-            let position =
-                light.position() + glam::Vec2::new((right - left) / 360.0, (down - up) / 180.0);
-            light.set_position(glam::Vec2::new(
-                position.x.rem_euclid(1.0),
-                position.y.clamp(0.0, 1.0),
-            ));
-            self.dirty = true;
+            return;
         }
+
+        let shape = light.shape;
+        let light = &mut self.document.lights[index];
+        self.dirty |= ctx.input_mut(|input| {
+            let mut changed = false;
+            input.events.retain(|event| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    return true;
+                };
+                let Some(mode) = NudgeMode::from_modifiers(*modifiers) else {
+                    return true;
+                };
+                let delta = match key {
+                    egui::Key::ArrowLeft => glam::Vec2::NEG_X,
+                    egui::Key::ArrowRight => glam::Vec2::X,
+                    egui::Key::ArrowUp => glam::Vec2::Y,
+                    egui::Key::ArrowDown => glam::Vec2::NEG_Y,
+                    _ => return true,
+                };
+                match mode {
+                    NudgeMode::Position
+                        if shape.is_positioned() || shape == LightShape::CompositeLight =>
+                    {
+                        let position = light.position() + delta / glam::Vec2::new(360.0, -180.0);
+                        light.set_position(glam::Vec2::new(
+                            position.x.rem_euclid(1.0),
+                            position.y.clamp(0.0, 1.0),
+                        ));
+                        changed = true;
+                    }
+                    NudgeMode::Size if shape.is_positioned() => {
+                        changed |= nudge_value(&mut light.width_degrees, delta.x, WIDTH_RANGE);
+                        changed |= nudge_value(&mut light.height_degrees, delta.y, HEIGHT_RANGE);
+                    }
+                    NudgeMode::Intensity
+                        if delta.y != 0.0
+                            && (shape.is_positioned()
+                                || shape == LightShape::GradientBackground) =>
+                    {
+                        changed |= nudge_value(&mut light.intensity, delta.y, INTENSITY_RANGE);
+                    }
+                    _ => return true,
+                }
+                false
+            });
+            changed
+        });
     }
 
     fn delete_layer(&mut self, index: usize) {
@@ -1068,6 +1233,8 @@ impl Editor {
     fn reset_canvas(&mut self) {
         self.canvas_revision += 1;
         self.canvas_view = CanvasView::Hdr;
+        self.canvas_image = None;
+        self.displayed_canvas_ev = None;
         self.texture = None;
         self.falloff_stale = true;
         self.canvas_drag = None;
@@ -1110,12 +1277,9 @@ impl Editor {
         };
         let mut direction = direction;
         for parent in &self.composite_parents {
-            direction =
-                glam::Quat::from_rotation_y(parent.document.rotation.to_radians()) * direction;
             direction = parent.document.lights[parent.layer].composite_local_rotation() * direction;
         }
-        let mut uv = crate::environment::panorama_uv(direction);
-        uv.x = (uv.x - self.document.rotation / 360.0).rem_euclid(1.0);
+        let uv = crate::environment::panorama_uv(direction);
         let light = &mut self.document.lights[index];
         self.dirty |= uv != light.position();
         light.set_position(uv);
@@ -1144,7 +1308,7 @@ impl Editor {
         std::thread::spawn(move || {
             let result = HdrImage::load(&path).map(|image| {
                 (
-                    image,
+                    ImageSource::shared(image),
                     path.file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
@@ -1167,11 +1331,14 @@ impl Editor {
             {
                 match result {
                     Ok((image, name)) => {
-                        self.status = format!("Loaded {} × {}", image.width, image.height);
+                        self.status = format!(
+                            "Loaded {} × {}",
+                            image.original.width, image.original.height
+                        );
                         if layer.name == format!("Image {}", layer.id) {
                             layer.name = name.clone();
                         }
-                        layer.image_layer.image = Some(Arc::new(image));
+                        layer.image_layer.image = Some(image);
                         layer.image_layer.source = name;
                         self.dirty = true;
                     }
@@ -1197,6 +1364,27 @@ impl Editor {
         }
     }
     pub fn lighting_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Slider::new(&mut self.lighting.canvas_exposure_ev, -10.0..=10.0)
+                .text("Canvas Exposure (EV)"),
+        )
+        .on_hover_text("Adjust the HDR Canvas display.");
+        ui.add(
+            egui::Slider::new(&mut self.lighting.render_preview_exposure_ev, -10.0..=10.0)
+                .text("Render Preview Exposure (EV)"),
+        )
+        .on_hover_text("Adjust the 3D render preview display.");
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.strong("Preview Material");
+        ui.add(egui::Slider::new(&mut self.lighting.roughness, 0.0..=1.0).text("Roughness"));
+        ui.add(egui::Slider::new(&mut self.lighting.metallic, 0.0..=1.0).text("Metallic"));
+        ui.checkbox(&mut self.lighting.ray_reflections, "Ray-traced reflections")
+            .on_hover_text("Trace one reflection to nearby surfaces when HDR lighting is on.");
+
+        ui.add_space(4.0);
+        ui.separator();
         ui.add_enabled(
             self.has_light_layers(),
             egui::Checkbox::new(&mut self.lighting.default_light, "Default lighting"),
@@ -1251,13 +1439,6 @@ impl Editor {
             self.lighting.preview_scale,
             "%",
         );
-        ui.collapsing("Preview material", |ui| {
-            ui.checkbox(&mut self.lighting.ray_reflections, "Ray-traced reflections")
-                .on_hover_text("Trace one reflection to nearby surfaces when HDR lighting is on.");
-            ui.add(egui::Slider::new(&mut self.lighting.roughness, 0.0..=1.0).text("Roughness"));
-            ui.add(egui::Slider::new(&mut self.lighting.metallic, 0.0..=1.0).text("Metallic"));
-            ui.small("Preview material only; not part of the exported HDR.");
-        });
         if !self.lighting.environment
             && (self.lighting.soft_shadows
                 || self.lighting.floor_shadows
@@ -1279,34 +1460,40 @@ impl Editor {
                 ui.strong(&parent.document.lights[parent.layer].name);
             }
         }
-        self.dirty |= ui
-            .add(egui::Slider::new(&mut self.document.exposure, -10.0..=10.0).text("Exposure (EV)"))
-            .changed();
-        self.dirty |= ui
-            .add(
-                egui::Slider::new(&mut self.document.rotation, -180.0..=180.0).text("Rotation (°)"),
-            )
-            .changed();
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Light layers");
-            if ui
-                .add_enabled(
+        ui.heading("Light Layers");
+        ui.add_space(5.0);
+        let add_light = ui
+            .scope(|ui| {
+                let widgets = &mut ui.visuals_mut().widgets;
+                for (state, color) in [
+                    (&mut widgets.inactive, egui::Color32::from_rgb(22, 79, 115)),
+                    (&mut widgets.hovered, egui::Color32::from_rgb(28, 97, 139)),
+                    (&mut widgets.active, egui::Color32::from_rgb(16, 65, 97)),
+                ] {
+                    state.weak_bg_fill = color;
+                    state.bg_fill = color;
+                    state.fg_stroke.color = egui::Color32::WHITE;
+                }
+                ui.add_enabled(
                     self.document.lights.len() < 32,
-                    egui::Button::new("+ Add light"),
+                    egui::Button::new(egui::RichText::new("+ Add Light").strong())
+                        .min_size(egui::vec2(ui.available_width(), 34.0)),
                 )
+                .on_disabled_hover_text("This list has reached its 32-layer limit.")
                 .clicked()
-            {
-                self.add_light();
-            }
-        });
+            })
+            .inner;
+        if add_light {
+            self.add_light();
+        }
+        ui.add_space(5.0);
         let mut drop = None;
         let mut action = None;
         let mut rename = None;
         if !self.document.lights.is_empty() {
             egui::ScrollArea::vertical()
                 .id_salt("light-list")
-                .max_height(166.0)
+                .max_height((ui.clip_rect().height() * 0.34).clamp(166.0, 280.0))
                 .scroll_source(
                     egui::scroll_area::ScrollSource::SCROLL_BAR
                         | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
@@ -1560,6 +1747,28 @@ impl Editor {
                     .checkbox(&mut layer.linear, "Linear")
                     .on_hover_text("On: use linear RGB. Off: decode the image as sRGB.")
                     .changed();
+            } else if light.shape == LightShape::GradientBackground {
+                self.dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut light.intensity, INTENSITY_RANGE)
+                            .logarithmic(true)
+                            .text("Intensity"),
+                    )
+                    .changed();
+                let ramp = &mut light.gradient_background;
+                egui::CollapsingHeader::new("Color ramp")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        self.dirty |= background_color_controls(ui, ramp);
+                    });
+                for (label, curve) in [
+                    ("Brightness ramp", &mut ramp.value),
+                    ("Alpha ramp", &mut ramp.alpha),
+                ] {
+                    egui::CollapsingHeader::new(label).show(ui, |ui| {
+                        self.dirty |= falloff_controls(ui, curve, true, true);
+                    });
+                }
             } else if light.shape == LightShape::CompositeLight {
                 if ui
                     .add_enabled(
@@ -1577,17 +1786,18 @@ impl Editor {
                 });
                 self.dirty |= ui
                     .add(
-                        egui::Slider::new(&mut light.intensity, 0.0..=10000.0)
+                        egui::Slider::new(&mut light.intensity, INTENSITY_RANGE)
                             .logarithmic(true)
                             .text("Intensity"),
                     )
                     .changed();
                 self.dirty |= ui
-                    .add(egui::Slider::new(&mut light.width_degrees, 1.0..=180.0).text("Width (°)"))
+                    .add(egui::Slider::new(&mut light.width_degrees, WIDTH_RANGE).text("Width (°)"))
                     .changed();
                 self.dirty |= ui
                     .add(
-                        egui::Slider::new(&mut light.height_degrees, 1.0..=90.0).text("Height (°)"),
+                        egui::Slider::new(&mut light.height_degrees, HEIGHT_RANGE)
+                            .text("Height (°)"),
                     )
                     .changed();
                 let directional = light.shape == LightShape::Gradient;
@@ -1638,7 +1848,7 @@ impl Editor {
                         self.dirty |= mapping_hotspot_cut_controls(ui, light);
                     });
             }
-            if light.shape != LightShape::Image {
+            if light.shape.is_positioned() || light.shape == LightShape::CompositeLight {
                 self.dirty |= position_controls(ui, light);
             }
         }
@@ -1648,22 +1858,31 @@ impl Editor {
         if let Some(index) = edit_composite {
             self.edit_composite(index);
         }
-        ui.separator();
-        egui::ComboBox::from_id_salt("hdr-output-size")
-            .selected_text(format!("{} × {}", self.export_width, self.export_width / 2))
-            .show_ui(ui, |ui| {
-                for width in EXPORT_WIDTHS {
-                    ui.selectable_value(
-                        &mut self.export_width,
-                        width,
-                        format!("{width} × {}", width / 2),
-                    );
-                }
-            });
+        self.feedback(ui);
+    }
+
+    pub fn file_controls(&mut self, ui: &mut egui::Ui, button_size: egui::Vec2) {
+        ui.strong("HDR output");
+        ui.label("Render size");
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = button_size.y;
+            egui::ComboBox::from_id_salt("hdr-output-size")
+                .width(button_size.x)
+                .selected_text(format!("{} × {}", self.export_width, self.export_width / 2))
+                .show_ui(ui, |ui| {
+                    for width in EXPORT_WIDTHS {
+                        ui.selectable_value(
+                            &mut self.export_width,
+                            width,
+                            format!("{width} × {}", width / 2),
+                        );
+                    }
+                });
+        });
         if ui
             .add_enabled(
                 self.export.is_none() && self.importing.is_none() && !self.vray_link.is_rendering(),
-                egui::Button::new("Export HDR…"),
+                egui::Button::new("Export HDR…").min_size(button_size),
             )
             .clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -1693,11 +1912,18 @@ impl Editor {
                 ui.label("Exporting HDR…");
             });
         }
+        ui.separator();
+        ui.strong("Maya V-Ray");
         self.vray_link.controls(
             ui,
+            button_size,
             self.export_width,
             self.importing.is_some() || self.export.is_some(),
         );
+        self.feedback(ui);
+    }
+
+    fn feedback(&self, ui: &mut egui::Ui) {
         if !self.status.is_empty() {
             ui.small(&self.status);
         }
@@ -1799,13 +2025,12 @@ impl Editor {
         }
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         let to_panorama = |p: egui::Pos2| {
-            egui::vec2(
+            glam::Vec2::new(
                 (p.x - rect.left()) / rect.width() + CANVAS_SEAM_U,
                 (p.y - rect.top()) / rect.height(),
             )
         };
         let pointer = response.interact_pointer_pos().map(to_panorama);
-        let rotation = self.document.rotation / 360.0;
         // Drag-start may arrive after the pointer has moved substantially.
         // Hit-test at the press origin, then retain the original grab offset.
         let drag_started = response.drag_started_by(egui::PointerButton::Primary);
@@ -1820,7 +2045,7 @@ impl Editor {
             && let Some(uv) = pointer
         {
             let i = self.add_light();
-            self.document.lights[i].u = (uv.x - rotation).rem_euclid(1.0);
+            self.document.lights[i].u = uv.x.rem_euclid(1.0);
             self.document.lights[i].v = uv.y.clamp(0.005, 0.995);
         } else if (response.clicked() || drag_started)
             && let Some(uv) = hit_pointer
@@ -1828,7 +2053,7 @@ impl Editor {
             let on_composite_handle = |index: usize| {
                 let light = &self.document.lights[index];
                 let position = light.position();
-                let dx = (position.x + rotation - uv.x + 0.5).rem_euclid(1.0) - 0.5;
+                let dx = (position.x - uv.x + 0.5).rem_euclid(1.0) - 0.5;
                 let offset = egui::vec2(dx * rect.width(), (position.y - uv.y) * rect.height());
                 can_move(light)
                     && light.shape == LightShape::CompositeLight
@@ -1846,8 +2071,8 @@ impl Editor {
                         .find(|(index, light)| {
                             (editing_hdr || self.selected == Some(*index))
                                 && solo.map_or_else(
-                                    || light.hit(uv.x - rotation, uv.y),
-                                    |id| id == light.id && light.hit_visible(uv.x - rotation, uv.y),
+                                    || light.hit(uv.x, uv.y),
+                                    |id| id == light.id && light.hit_visible(uv.x, uv.y),
                                 )
                         })
                         .map(|(i, _)| i)
@@ -1856,9 +2081,7 @@ impl Editor {
                 self.selected = hit;
             }
             if drag_started {
-                let grabbed = glam::Vec2::new(uv.x - rotation, uv.y);
-                self.canvas_drag =
-                    hit.map(|i| CanvasDrag::new(i, &self.document.lights[i], grabbed));
+                self.canvas_drag = hit.map(|i| CanvasDrag::new(i, &self.document.lights[i], uv));
             }
         }
         if (response.dragged_by(egui::PointerButton::Primary)
@@ -1870,7 +2093,7 @@ impl Editor {
                 .get_mut(drag.index)
                 .filter(|light| can_move(light))
         {
-            drag.apply(light, glam::Vec2::new(uv.x - rotation, uv.y));
+            drag.apply(light, uv);
             self.dirty = true;
         }
         if response.drag_stopped() {
@@ -1886,7 +2109,7 @@ impl Editor {
             let selected = self.selected == Some(i);
             if light.shape == LightShape::CompositeLight {
                 if selected {
-                    draw_composite_handle(&painter, rect, light.position(), rotation);
+                    draw_composite_handle(&painter, rect, light.position());
                 }
                 continue;
             }
@@ -1896,7 +2119,7 @@ impl Editor {
                 egui::Color32::WHITE
             };
             let stroke = egui::Stroke::new(if selected { 2.0_f32 } else { 1.0_f32 }, color);
-            draw_light_guide(&painter, rect, light, rotation, selected, stroke);
+            draw_light_guide(&painter, rect, light, selected, stroke);
         }
     }
     pub fn refresh(&mut self, ctx: &egui::Context) -> Option<Arc<HdrImage>> {
@@ -1914,22 +2137,27 @@ impl Editor {
             self.preview_job = None;
             if let Some(images) = image {
                 if images.canvas_revision == self.canvas_revision {
-                    let color = canvas_texture(size, images.canvas.display_pixels());
-                    if let Some(texture) = &mut self.texture {
-                        texture.set(color, egui::TextureOptions::LINEAR);
-                    } else {
-                        self.texture = Some(ctx.load_texture(
-                            "HDR canvas",
-                            color,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
+                    self.canvas_image = Some(images.canvas);
+                    self.displayed_canvas_ev = None;
                     if self.preview_visible.load(Ordering::Relaxed) {
                         completed = images.environment;
                     }
                 }
                 ctx.request_repaint();
             }
+        }
+        let exposure = self.lighting.canvas_exposure_ev;
+        if let Some(canvas) = &self.canvas_image
+            && self.displayed_canvas_ev != Some(exposure)
+        {
+            let color = canvas_texture(size, canvas.display_pixels(exposure));
+            if let Some(texture) = &mut self.texture {
+                texture.set(color, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture =
+                    Some(ctx.load_texture("HDR canvas", color, egui::TextureOptions::LINEAR));
+            }
+            self.displayed_canvas_ev = Some(exposure);
         }
         if self.dirty && self.preview_job.is_none() {
             // Coalesce edits while the worker renders. The next job uses the latest document.
@@ -1943,13 +2171,13 @@ impl Editor {
             let ctx = ctx.clone();
             self.preview_job = Some(job);
             std::thread::spawn(move || {
-                let canvas = Arc::new(document.compose(PREVIEW_WIDTH, PREVIEW_HEIGHT));
+                let canvas = Arc::new(document.compose_preview(PREVIEW_WIDTH, PREVIEW_HEIGHT));
                 let environment = if at_root && visible.load(Ordering::Relaxed) {
                     Some(canvas.clone())
                 } else {
                     environment
                         .and_then(|doc| {
-                            doc.compose_while(PREVIEW_WIDTH, PREVIEW_HEIGHT, || {
+                            doc.compose_preview_while(PREVIEW_WIDTH, PREVIEW_HEIGHT, || {
                                 visible.load(Ordering::Relaxed)
                             })
                         })
@@ -2019,6 +2247,59 @@ fn preview_quality_options(
 mod tests {
     use super::*;
 
+    fn editor_key(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+        pressed: bool,
+    ) {
+        let input = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            let (before, _) = editor.begin_edit_frame(ctx);
+            editor.finish_edit_frame(ctx, before);
+        });
+    }
+
+    #[test]
+    fn preview_exposures_do_not_change_the_document_or_recompose_hdr() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        editor.add_light();
+        let document = editor.project_document();
+        let canvas = Arc::new(document.compose_preview(PREVIEW_WIDTH, PREVIEW_HEIGHT));
+        editor.canvas_image = Some(canvas.clone());
+        editor.dirty = false;
+
+        let update = |editor: &mut Editor| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                assert!(editor.refresh(ctx).is_none());
+                assert!(editor.preview_job.is_none());
+            })
+            .textures_delta
+            .set
+        };
+        update(&mut editor);
+        let texture = editor.texture.as_ref().unwrap().id();
+
+        editor.lighting.render_preview_exposure_ev = 2.0;
+        assert!(update(&mut editor).iter().all(|(id, _)| *id != texture));
+        editor.lighting.canvas_exposure_ev = -2.0;
+        assert!(update(&mut editor).iter().any(|(id, _)| *id == texture));
+        assert!(Arc::ptr_eq(editor.canvas_image.as_ref().unwrap(), &canvas));
+        assert!(editor.project_document() == document);
+    }
+
     #[test]
     fn nudge_and_delete_keyboard_shortcuts_can_be_undone_and_redone() {
         let mut editor = Editor::default();
@@ -2026,21 +2307,7 @@ mod tests {
         let initial = editor.document.lights[index].position();
         let ctx = egui::Context::default();
         let key = |editor: &mut Editor, key, modifiers, pressed| {
-            let input = egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: Some(key),
-                    pressed,
-                    repeat: false,
-                    modifiers,
-                }],
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                let (before, _) = editor.begin_edit_frame(ctx);
-                editor.finish_edit_frame(ctx, before);
-            });
+            editor_key(&ctx, editor, key, modifiers, pressed);
         };
         key(
             &mut editor,
@@ -2065,6 +2332,64 @@ mod tests {
         assert!(editor.document.lights.is_empty());
         key(&mut editor, egui::Key::Z, egui::Modifiers::CTRL, true);
         assert_eq!(editor.document.lights[index].position(), nudged);
+    }
+
+    #[test]
+    fn modified_arrows_nudge_dimensions_and_intensity_within_slider_ranges() {
+        use egui::{Key, Modifiers};
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        let index = editor.add_light();
+        let original = editor.document.lights[index].position();
+        let values = |editor: &Editor| {
+            let light = &editor.document.lights[index];
+            (light.width_degrees, light.height_degrees, light.intensity)
+        };
+        let press = |editor: &mut Editor, key, modifiers| {
+            editor_key(&ctx, editor, key, modifiers, true);
+            editor_key(&ctx, editor, key, modifiers, false);
+        };
+        editor_key(&ctx, &mut editor, Key::ArrowRight, Modifiers::SHIFT, true);
+        editor_key(&ctx, &mut editor, Key::ArrowRight, Modifiers::SHIFT, true);
+        editor_key(&ctx, &mut editor, Key::ArrowRight, Modifiers::SHIFT, false);
+        assert_eq!(values(&editor), (42.0, 40.0, 10.0));
+        press(&mut editor, Key::Z, Modifiers::CTRL);
+        assert_eq!(values(&editor), (40.0, 40.0, 10.0));
+        press(&mut editor, Key::Y, Modifiers::CTRL);
+        press(&mut editor, Key::ArrowLeft, Modifiers::SHIFT);
+        press(&mut editor, Key::ArrowUp, Modifiers::SHIFT);
+        press(
+            &mut editor,
+            Key::ArrowUp,
+            Modifiers::CTRL | Modifiers::COMMAND,
+        );
+        assert_eq!(values(&editor), (41.0, 41.0, 11.0));
+        press(&mut editor, Key::ArrowDown, Modifiers::SHIFT);
+        press(&mut editor, Key::ArrowDown, Modifiers::CTRL);
+        assert_eq!(values(&editor), (41.0, 40.0, 10.0));
+        assert_eq!(editor.document.lights[index].position(), original);
+
+        let light = &mut editor.document.lights[index];
+        light.width_degrees = *WIDTH_RANGE.end();
+        light.height_degrees = *HEIGHT_RANGE.start();
+        light.intensity = *INTENSITY_RANGE.start();
+        press(&mut editor, Key::ArrowRight, Modifiers::SHIFT);
+        press(&mut editor, Key::ArrowDown, Modifiers::SHIFT);
+        press(&mut editor, Key::ArrowDown, Modifiers::CTRL);
+        assert_eq!(values(&editor), (180.0, 1.0, 0.0));
+
+        editor.document.lights[index].shape = LightShape::GradientBackground;
+        press(&mut editor, Key::ArrowLeft, Modifiers::SHIFT);
+        press(
+            &mut editor,
+            Key::ArrowUp,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        );
+        press(&mut editor, Key::ArrowUp, Modifiers::CTRL);
+        assert_eq!(values(&editor), (180.0, 1.0, 1.0));
+        editor.document.lights[index].locked = true;
+        press(&mut editor, Key::ArrowUp, Modifiers::CTRL);
+        assert_eq!(values(&editor), (180.0, 1.0, 1.0));
     }
 
     #[test]

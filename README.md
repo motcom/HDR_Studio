@@ -26,23 +26,26 @@ cargo build --release
 - **File → New Project** で空のプロジェクトを開始します。
 - **File → Save Project…** で現在のプロジェクトを `.lmo` に保存します。初回は `NewProject.lmo`、以降は開いているプロジェクト名が入力されます。ダイアログで名前と保存先を変更できます。
 - **File → Load Project…** または `.lmo` のドラッグ＆ドロップで開きます。ライトレイヤー、HDR／EXR の画像データ、取り込んだ Alembic、カメラの画角と選択状態をファイル内に保存します。元の `.abc` や `.camera.json`、HDR／EXR が移動しても復元できます。
+- 右側の **File** タブにある **Remove All Models** はモデルをすべて取り除き、カメラは保持します。**Remove Selected Camera** は **Fixed camera** で選択中のカメラを取り除きます。どちらの操作でも HDR レイヤーを保持します。**Import Alembic…** で別のモデルとカメラを読み込むと、同じ照明をそのまま使えます。
 
 ## HDR の編集と照明
 
 1. **Import Alembic…** でモデルとカメラを読み込みます。
 2. ライトレイヤーがゼロのときは **Default lighting** が自動でオンになり、内蔵のキーライトとベースの明るさでモデルを表示します。レイヤーがあるときは **Lighting** タブで設定できます。**HDR lighting** は環境光・映り込みをまとめて ON/OFF します。
-3. **HDR environment → + Add light → Shape → Image → Load HDR / EXR…** で、2:1 の全天球パノラマをレイヤーとして読み込みます。HDR/EXR をウィンドウにドロップしても Image レイヤーを追加できます。HDR キャンバスのダブルクリックでは丸形ライトを追加します。レイヤーを追加するたびに **Default lighting** が自動で OFF になります。
+3. **HDR environment → + Add Light → Shape → Image → Load HDR / EXR…** で、2:1 の全天球パノラマをレイヤーとして読み込みます。HDR/EXR をウィンドウにドロップしても Image レイヤーを追加できます。HDR キャンバスのダブルクリックでは丸形ライトを追加します。レイヤーを追加するたびに **Default lighting** が自動で OFF になります。
 4. キャンバスのライトをドラッグして移動します。ライトを選ぶと、色・強度・幅・高さ・減衰カーブ・経度・緯度を編集できます。ライトごとに ON/OFF、削除ができます。
-5. タブ上部の `Exposure (EV)` と `Rotation (°)` は合成全体に適用します。Image レイヤーの `Image rotation (°)` は水平方向のオフセット、`Image exposure (EV)` は画像の露出、`Alpha` はレイヤーの不透明度です。`Linear` の既定はオンで、オフにすると入力を sRGB としてリニア RGB に変換します。
-6. `Export HDR…` で照明を合成した Radiance `.hdr` を保存します。指定した出力解像度を使い、1.0 を超える値を保持します。表示用のトーンマッピング、Default lighting、プレビュー材質は書き出しません。
+5. **Lighting** タブ上部の **Canvas Exposure (EV)** は HDR Canvas、**Render Preview Exposure (EV)** は 3D プレビューの表示だけに適用します。HDR 書き出しと Maya ライブ同期はレイヤーの合成結果を使用します。Image レイヤーの `Image rotation (°)` は水平方向のオフセット、`Image exposure (EV)` は画像の露出、`Alpha` はレイヤーの不透明度です。`Linear` の既定はオンで、オフにすると入力を sRGB としてリニア RGB に変換します。
+6. 右側の **File** タブで **Render size** を選び、**Export HDR…** で照明を合成した Radiance `.hdr` を保存します。1.0 を超える値を保持します。表示用のトーンマッピング、Default lighting、プレビュー材質は書き出しません。
 
 レイヤーは一覧の下から上へ合成します。行の左端にあるハンドルをドラッグすると順序が変わり、行の右側で **Blend** を切り替えられます。鍵アイコンをオンにすると、レイヤーの選択、プロパティの変更、ライトの移動がロックされます。ロック中も合成と並べ替えは有効です。
 
 レイヤー行を右クリックすると **Rename…**、**Solo / Exit Solo**、**Delete** が使えます。ソロの行は琥珀色になり、そのレイヤーをプレビューで単独確認できます。解除すると元の表示に戻ります。HDR 書き出しは通常のレイヤー設定を使います。選択中のレイヤーは **Delete** キーで削除できます。位置を持つライトは **矢印キー** で 1° ずつ移動できます。**Ctrl+Z** で HDR 編集を取り消し、**Ctrl+Y** でやり直せます。
 
+選択中のライトの **Width** は **Shift+←／→**、**Height** は **Shift+↓／↑** で 1° ずつ増減できます。**Intensity** は **Ctrl+↓／↑** で 1 ずつ増減できます。矢印キーを押し続けた調整は、1 回の Undo で戻せます。
+
 Image の既定の Blend は **Over** で、Alpha に応じて下の合成結果を覆います。**Add** はライトの RGB を加算、**Multiply** は照射範囲内で下の RGB にライトの RGB を乗算、**Amplify** は下の RGB に `1 + ライトの RGB` を乗算します。Multiply と Amplify を使うときは、下のレイヤーに光が必要です。Multiply の **Mask** をオンにすると、ライトの範囲外が黒になります。
 
-**Shape → CompositeLight → Edit composite** で子レイヤーの一覧とキャンバスを開きます。**+ Add light** で子レイヤーを追加し、**Back** で親の一覧に戻ります。親を選び、HDR Canvas 上の合成結果または十字ハンドルをドラッグすると、子ライト全体が移動します。経度・緯度の数値入力でも配置できます。子レイヤーを合成した結果に親の **Blend** を適用します。編集中も 3D プレビューと HDR 書き出しには全体の合成結果を使います。
+**Shape → CompositeLight → Edit composite** で子レイヤーの一覧とキャンバスを開きます。**+ Add Light** で子レイヤーを追加し、**Back** で親の一覧に戻ります。親を選び、HDR Canvas 上の合成結果または十字ハンドルをドラッグすると、子ライト全体が移動します。経度・緯度の数値入力でも配置できます。子レイヤーを合成した結果に親の **Blend** を適用します。編集中も 3D プレビューと HDR 書き出しには全体の合成結果を使います。
 
 **Over** は減衰カーブを不透明度として使い、下の色をライトの色で覆います。**Low Pass** はライトの強度と色で決まる上限を下の明るさに適用し、減衰カーブで効果を混ぜます。**Invert** をオンにすると、Add は下の色比を保ったまま明るさを引く Dark Light になり、Low Pass は明るさの下限になります。Amplify では増光倍率の逆数で減光します。
 
@@ -54,15 +57,19 @@ Image の既定の Blend は **Over** で、Alpha に応じて下の合成結果
 
 **Shape → Gradient** は片側から反対側へ明るさが変わる矩形です。既定の **Linear** は左から右へ暗くなり、**Gradient direction** で方向を変えられます。**Gradient curve** で始点から終点までを編集できます。キャンバス上で矩形の外形を保つには **Mapping → Flat** を選びます。
 
+**HDR environment → + Add Light** でレイヤーを追加し、**Layer properties → Shape → Gradient Background** を選ぶと、HDR マップ全体を覆う縦方向の背景になります。ほかのライトの下に敷くには、レイヤー行のハンドルで一覧の下に移動します。**Color ramp** で色と色の制御点、**Brightness ramp** で明るさ、**Alpha ramp** で透明度を調整できます。各ランプは上端から下端へ適用されます。
+
 キャンバス上部の **HDR Canvas** は合成結果にトーンマッピングと sRGB 変換をかけて表示します。**Falloff Preview** は選択中のライトの芯を白の基準にして、減衰をグレースケールで直接表示します。Gradient ではカーブの最大値を白の基準にします。どちらの表示でも見えているライトをドラッグして移動できます。レイヤーのチェックを外すと両方の表示から消えます。3D 照明と書き出しには合成済みのリニア HDR を使います。
 
 ツールバーの **3D Preview** をオフにすると、3D の描画と描画用データの準備を止め、キャンバスを 2:1 のまま空いた領域に拡大します。キャンバスでの編集と HDR の書き出しは引き続き使えます。再びオンにすると、現在の HDR 合成結果で 3D プレビューを再開します。
 
 **Shape → Round** は幅と高さを変えると楕円になります。Rectangle と Round では **Hotspot position** の点をドラッグすると、外形を固定したまま明るさの芯が移動します。**Hard cut** をオンにすると、円形ダイヤルか **Cutoff rotation** の数値入力で、切り落とす方向を 0〜360° から指定できます。矢印は切る側を指し、0° は右、90° は下です。**Trim** はその方向に沿った切断線の位置を調整します。50% でライトの中央を通ります。
 
-`HDR background` は固定カメラから見た環境背景を表示します。`Preview material` の Roughness / Metallic で映り込みを確認できます。メッシュの元の材質を再現する機能ではありません。カメラの画角は照明編集によって変えません。
+`HDR background` は固定カメラから見た環境背景を表示します。**Lighting → Preview Material** は 2 つの表示用 Exposure のすぐ下に常時表示され、Roughness / Metallic で映り込みを確認できます。メッシュの元の材質を再現する機能ではありません。カメラの画角は照明編集によって変えません。
 
 読み込みと書き出しは別スレッドで処理します。インタラクティブな照明確認には 512×256 の HDR テクスチャ、SH による拡散光、ミップマップによる概算の反射を使用します。**Lighting → Preview material → Ray-traced reflections** をオンにすると、滑らかな面に別の面や物体が映り込みます。反射は1段で、粗い面では HDR の近似反射に滑らかに戻ります。書き出しは元の HDR 画像とライト定義から指定解像度で再合成します。
+
+Image レイヤーは元の解像度の RGB32F 画素を保持します。横幅が 700 px を超える HDR／EXR は、読み込み時に面積平均で 700 × 350 px の編集用画像を作り、HDR キャンバス、3D 照明、Maya のライブ同期に再利用します。横幅が 700 px 以下の画像はそのサイズで使います。`.lmo` には元解像度の画素を保存し、開くと編集用画像を作り直します。
 
 **Lighting → HDR soft shadows** はモデル表面に、**Show floor shadows** はモデルの最下部に合わせた床に HDR の影を表示します。両方とも **HDR lighting** がオンのときに使えます。HDRI 上で光源の見かけの幅が広いほど、影の縁は柔らかくなります。床と表面の影はプレビュー用です。
 
@@ -98,17 +105,19 @@ maya_hdr_studio.install_shelf()
 
 ## Maya の V-Ray Dome Light と同期する
 
-1. HDR STUDIO の **HDR environment → Link Maya V-Ray** を押すと、`%LOCALAPPDATA%\HDR STUDIO\vray-sync\hdr_studio_vray.hdr` に 700 × 350 px の同期用 HDR が作られます。
+1. HDR STUDIO の右側の **File** タブで **Live preview size** を選び、**Link Maya V-Ray** を押します。同期用 HDR が `%LOCALAPPDATA%\HDR STUDIO\vray-sync\hdr_studio_vray.hdr` に作られます。
 2. 同じPC・同じWindowsユーザーで Maya を起動し、`HDRStudio` シェルフの **HDR STUDIO → V-Ray Sync → Start Sync** を押します。Maya は同期用の HDR を同じ場所から自動で参照します。
 3. Maya はシーン全体の V-Ray Dome Light を確認します。0灯なら `HDRStudioDome` を作り、1灯なら使用するか確認します。**Use Existing** を選ぶと既存の **Dome Tex** 接続を切り替え、**Use Dome Tex** と **Dome Spherical** を有効にします。**Cancel** を選ぶと同期開始を取り消します。2灯以上ある場合は警告を表示し、同期開始を取り消します。
 
 HDR STUDIO は編集操作中も全レイヤーの合成結果を同期用ファイルへ書き出します。**V-Ray HDR saved** の括弧内に保存回数を表示し、ファイルが一時的に使用中なら保存を再試行します。Maya は同じフォルダーで `*.maya-…-a.hdr` と `*.maya-…-b.hdr` を交互に更新し、保存完了後にドームのテクスチャパスを切り替えます。最後の HDR 更新から **Reload delay**（250〜2000 ms、初期値500 ms）で指定した時間が経過すると、File ノードの **Reload** を1回実行し、V-Ray IPR に再描画を要求します。スライダーは同期中も調整でき、待機中に調整すると新しい待ち時間でタイマーが始まります。
 
+**Live preview size** は 350 × 175、512 × 256、700 × 350 px（起動時の既定）から選べます。同期中の変更は次の書き出しで反映します。仕上げ用 HDR を表示中のときは **Resume Live Sync** の後に反映します。仕上げ用 HDR と通常の HDR 書き出しの解像度は **Render size** で指定します。
+
 **Sync now** で手動更新、**Stop V-Ray sync** で HDR STUDIO 側の書き出しを停止できます。Maya 側の再読み込みは **Stop Sync** で停止します。ウィンドウを閉じても再読み込みは続きます。同期を止めた後も、Maya のドームは最後に適用した HDR を参照します。Maya でシーンを開き直したら **Start Sync** を押し、HDR STUDIO を再起動したら **Link Maya V-Ray** を押します。
 
 ### 仕上げ用 HDR を V-Ray に適用する
 
-HDR STUDIO の **HDR environment** で出力解像度を選び、**Render HDR for Maya…** を押して仕上げ用 `.hdr` の保存先を指定します。V-Ray の球面配置に合わせて保存し、完了後に Maya の Dome Light が指定先を直接参照します。編集中のプレビューに戻すときは **Resume Live Sync** を押します。
+HDR STUDIO の右側の **File** タブで **Render size** を選び、**Render HDR for Maya…** を押して仕上げ用 `.hdr` の保存先を指定します。V-Ray の球面配置に合わせて保存し、完了後に Maya の Dome Light が指定先を直接参照します。編集中のプレビューに戻すときは **Resume Live Sync** を押します。
 
 同期専用ファイルは Maya の Y-up／V-Ray の球面配置に合わせた向きで保存します。既存ドームに独自のマッピング回転や Finite Dome の設定がある場合は、V-Ray 側の結果にもその設定が反映されます。通常の HDR は **Export HDR…** で書き出せます。
 

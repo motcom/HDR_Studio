@@ -100,6 +100,8 @@ fn normalize(mut lighting: Lighting) -> Lighting {
     lighting.idle_preview_scale = lighting.idle_preview_scale.max(lighting.preview_scale);
     lighting.roughness = lighting.roughness.clamp(0.0, 1.0);
     lighting.metallic = lighting.metallic.clamp(0.0, 1.0);
+    lighting.canvas_exposure_ev = lighting.canvas_exposure_ev.clamp(-10.0, 10.0);
+    lighting.render_preview_exposure_ev = lighting.render_preview_exposure_ev.clamp(-10.0, 10.0);
     lighting
 }
 

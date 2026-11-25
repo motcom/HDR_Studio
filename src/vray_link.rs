@@ -1,4 +1,4 @@
-use crate::environment::{Document, HdrImage};
+use crate::environment::{Document, HdrImage, IMAGE_PREVIEW_WIDTH};
 use eframe::egui;
 use std::{
     fmt,
@@ -13,12 +13,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SYNC_WIDTH: u32 = 700;
-const SYNC_HEIGHT: u32 = SYNC_WIDTH / 2;
 const SYNC_INTERVAL: Duration = Duration::from_millis(120);
 const REPLACE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const PREVIEW_NAME: &str = "hdr_studio_vray.hdr";
 const TARGET_NAME: &str = "target.json";
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LivePreviewSize {
+    Small = 350,
+    Medium = 512,
+    #[default]
+    Standard = IMAGE_PREVIEW_WIDTH as isize,
+}
+
+impl LivePreviewSize {
+    fn dimensions(self) -> (u32, u32) {
+        let width = self as u32;
+        (width, width / 2)
+    }
+
+    fn label(self) -> String {
+        let (width, height) = self.dimensions();
+        format!("{width} × {height}")
+    }
+}
 
 #[derive(Debug)]
 enum PublishError {
@@ -37,8 +55,14 @@ impl fmt::Display for PublishError {
 
 #[derive(Clone)]
 enum Task {
-    Live { announce: bool },
-    Render { path: PathBuf, width: u32 },
+    Live {
+        announce: bool,
+        size: LivePreviewSize,
+    },
+    Render {
+        path: PathBuf,
+        width: u32,
+    },
 }
 
 struct Worker {
@@ -48,6 +72,7 @@ struct Worker {
 
 #[derive(Default)]
 pub struct VrayLink {
+    live_size: LivePreviewSize,
     path: Option<PathBuf>,
     lock: Option<Arc<File>>,
     observed: Option<Document>,
@@ -87,67 +112,48 @@ impl VrayLink {
                 .is_some_and(|worker| matches!(worker.task, Task::Render { .. }))
     }
 
-    pub fn controls(&mut self, ui: &mut egui::Ui, export_width: u32, busy: bool) {
+    pub fn controls(&mut self, ui: &mut egui::Ui, size: egui::Vec2, export_width: u32, busy: bool) {
+        ui.label("Live preview size");
+        let mut live_size = self.live_size;
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = size.y;
+            egui::ComboBox::from_id_salt("vray-live-preview-size")
+                .width(size.x)
+                .selected_text(live_size.label())
+                .show_ui(ui, |ui| {
+                    for option in [
+                        LivePreviewSize::Small,
+                        LivePreviewSize::Medium,
+                        LivePreviewSize::Standard,
+                    ] {
+                        ui.selectable_value(&mut live_size, option, option.label());
+                    }
+                });
+        });
+        self.set_live_size(live_size);
         if self.path.is_some() {
             let rendering = self.is_rendering();
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.worker.is_none() && !rendering,
-                        egui::Button::new("Stop V-Ray sync"),
-                    )
-                    .clicked()
-                {
-                    *self = Self::default();
-                    return;
-                }
-                let manual = if self.rendered.is_some() {
-                    "Resume Live Sync"
-                } else {
-                    "Sync now"
-                };
-                if ui
-                    .add_enabled(!rendering, egui::Button::new(manual))
-                    .clicked()
-                {
-                    self.announce_live |= self.rendered.take().is_some();
-                    self.pending = true;
-                    self.next_write = None;
-                }
-            });
-            if self.path.is_some()
-                && ui
-                    .add_enabled(
-                        !busy && !rendering && self.saved > 0,
-                        egui::Button::new("Render HDR for Maya…"),
-                    )
-                    .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Radiance HDR", &["hdr"])
-                    .set_file_name("lighting_vray.hdr")
-                    .save_file()
+            if ui
+                .add_enabled(
+                    self.worker.is_none() && !rendering,
+                    egui::Button::new("Stop V-Ray sync").min_size(size),
+                )
+                .clicked()
             {
-                match self.render_path(path) {
-                    Ok(path) => {
-                        self.render = Some(Task::Render {
-                            path,
-                            width: export_width,
-                        })
-                    }
-                    Err(error) => self.status = Some(error),
-                }
+                *self = Self {
+                    live_size,
+                    ..Self::default()
+                };
             }
-            if let Some(path) = &self.rendered {
-                ui.small(format!("Rendered HDR · {}", path.display()));
-            } else if self.path.is_some() {
-                ui.small(format!("Live HDR · {SYNC_WIDTH} × {SYNC_HEIGHT} px"));
-            }
-        } else if ui.button("Link Maya V-Ray").clicked() {
+        } else if ui
+            .add(egui::Button::new("Link Maya V-Ray").min_size(size))
+            .clicked()
+        {
             match crate::settings::app_data_dir()
                 .ok_or_else(|| io::Error::other("Windows Local App Data is unavailable"))
                 .and_then(|directory| Self::start_in(&directory.join("vray-sync")))
             {
-                Ok(link) => *self = link,
+                Ok(link) => *self = Self { live_size, ..link },
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.status =
                         Some("Another HDR STUDIO window is already linked to Maya.".into());
@@ -155,8 +161,57 @@ impl VrayLink {
                 Err(error) => self.status = Some(format!("Could not start V-Ray sync: {error}")),
             }
         }
+        let linked = self.path.is_some();
+        let rendering = self.is_rendering();
+        let manual = if self.rendered.is_some() {
+            "Resume Live Sync"
+        } else {
+            "Sync now"
+        };
+        if ui
+            .add_enabled(
+                linked && !rendering,
+                egui::Button::new(manual).min_size(size),
+            )
+            .clicked()
+        {
+            self.announce_live |= self.rendered.take().is_some();
+            self.pending = true;
+            self.next_write = None;
+        }
+        if ui
+            .add_enabled(
+                linked && !busy && !rendering && self.saved > 0,
+                egui::Button::new("Render HDR for Maya…").min_size(size),
+            )
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Radiance HDR", &["hdr"])
+                .set_file_name("lighting_vray.hdr")
+                .save_file()
+        {
+            match self.render_path(path) {
+                Ok(path) => {
+                    self.render = Some(Task::Render {
+                        path,
+                        width: export_width,
+                    })
+                }
+                Err(error) => self.status = Some(error),
+            }
+        }
+        if let Some(path) = &self.rendered {
+            ui.small(format!("Rendered HDR · {}", path.display()));
+        }
         if let Some(status) = &self.status {
             ui.small(status);
+        }
+    }
+
+    fn set_live_size(&mut self, size: LivePreviewSize) {
+        if self.live_size != size {
+            self.live_size = size;
+            self.pending = true;
         }
     }
 
@@ -249,6 +304,7 @@ impl VrayLink {
             self.next_write = Some(now + SYNC_INTERVAL);
             Task::Live {
                 announce: self.announce_live,
+                size: self.live_size,
             }
         };
 
@@ -270,8 +326,9 @@ impl VrayLink {
         let lock = self.lock.clone();
         std::thread::spawn(move || {
             let result = match task {
-                Task::Live { announce } => {
-                    publish(snapshot.compose(SYNC_WIDTH, SYNC_HEIGHT), &path).and_then(|()| {
+                Task::Live { announce, size } => {
+                    let (width, height) = size.dimensions();
+                    publish(snapshot.compose_preview(width, height), &path).and_then(|()| {
                         if announce {
                             announce_target(&path, None)
                         } else {
@@ -415,8 +472,11 @@ mod tests {
         finish(&mut link, &document);
         assert_eq!(read_target()["rendered_hdr"].as_str(), output.to_str());
         document.add_light();
+        link.set_live_size(LivePreviewSize::Medium);
         finish(&mut link, &document);
         assert_eq!(link.saved, 1);
+        assert_eq!(HdrImage::load(&source).unwrap().width, 700);
+        assert_eq!(read_target()["rendered_hdr"].as_str(), output.to_str());
 
         link.announce_live = link.rendered.take().is_some();
         link.pending = true;
@@ -424,6 +484,8 @@ mod tests {
         finish(&mut link, &document);
         assert!(read_target()["rendered_hdr"].is_null());
         assert_eq!(link.saved, 2);
+        let live = HdrImage::load(&source).unwrap();
+        assert_eq!((live.width, live.height), (512, 256));
 
         drop(link);
         for path in [source, target, output, cache.join("publisher.lock")] {
@@ -434,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_the_latest_light_edit_as_a_700_by_350_preview() {
+    fn writes_the_latest_light_edit_at_the_new_live_size() {
         let directory = Path::new("tests/output");
         fs::create_dir_all(directory).unwrap();
         let path = directory.join(format!("vray-preview-{}.hdr", std::process::id()));
@@ -445,7 +507,10 @@ mod tests {
             path: Some(path.clone()),
             observed: Some(document.clone()),
             worker: Some(Worker {
-                task: Task::Live { announce: false },
+                task: Task::Live {
+                    announce: false,
+                    size: LivePreviewSize::Standard,
+                },
                 result: worker,
             }),
             ..VrayLink::default()
@@ -457,6 +522,7 @@ mod tests {
         document.lights[light].width_degrees = 60.0;
         document.lights[light].intensity = 4.0;
         link.update(&ctx, &document, false);
+        link.set_live_size(LivePreviewSize::Small);
         assert!(link.pending);
 
         previous_write.send(Ok(())).unwrap();
@@ -484,7 +550,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let image = HdrImage::load(&path).unwrap();
-        assert_eq!((image.width, image.height), (700, 350));
+        assert_eq!((image.width, image.height), (350, 175));
         assert!(image.pixels.iter().any(|pixel| pixel[0] > 1.0));
         fs::remove_file(path).unwrap();
     }
@@ -524,7 +590,7 @@ mod tests {
             link.update(&ctx, &document, false);
         }
         assert_eq!(link.saved, 1);
-        assert_eq!(HdrImage::load(&path).unwrap().width, SYNC_WIDTH);
+        assert_eq!(HdrImage::load(&path).unwrap().width, 700);
         fs::remove_file(path).unwrap();
     }
 
