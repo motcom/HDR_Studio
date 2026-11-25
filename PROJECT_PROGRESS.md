@@ -9,6 +9,8 @@
 
 ### プロジェクト
 
+- 右側のタブは左から **File → Lighting → Environment**。Lighting にレイヤー編集、Environment にプレビュー設定と **Fixed camera** を置く。更新版は `target/release/HDR_STUDIO.exe`。
+- Environment の区切りを見直したビルドは、作業開始時に通常版が起動中だったため `target/file-tab/release/HDR_STUDIO.exe` に出力した。
 - 右側の **File** タブに **Render size**、**Export HDR…**、Maya V-Ray のリンク・同期停止・手動同期／再開・仕上げ HDR、**Remove All Models**、**Remove Selected Camera** を配置し、操作行の幅と高さを統一した。
 - **Remove All Models** はモデルと内包用 ABC を現在のプロジェクトから外し、現在のカメラと HDR レイヤーを保持する。**Remove Selected Camera** は選択中のカメラだけを外し、HDR レイヤーを保持する。選択中のカメラがなくなった場合は残っているカメラに切り替える。新規 Alembic の取り込み時には取り込み元のモデルとカメラを使う。
 - レイヤーと Lighting の配置更新版は `target/release/HDR_STUDIO.exe` にビルドした。同じ場所の `hdr_abc.dll` を使う。
@@ -36,14 +38,14 @@
 - `scripts/build-native.ps1` を追加。Maya の `maya_hdr_studio.export_selected()` は選択オブジェクトやグループの子孫と指定カメラを出力し、元の選択を復元する。アプリ内のメッシュ階層一覧は削除済み。Maya が法線を省略したスムースメッシュでは頂点法線を生成し、表示と Reflection／Diffuse によるライト配置に使う。
 - SH による拡散環境光と HDR テクスチャによる反射を表示する。`Ray-traced reflections` は滑らかな面で反射を1段追跡する。`HDR soft shadows` と `Show floor shadows` はモデルとプレビュー床にボケ影を表示する。
 - **2026-11-19** 専用描画スレッドを導入し、操作中は直前の画像を表示する。影の方向サンプルを画素ごとに変え、半影を粒状にした。解像度倍率、影サンプル数、操作中の最小画質、アイドル時の上限を設定できる。Lighting 設定はアプリの保存領域に保存する。
-- `3D Preview` をオフにすると 3D 描画を停止し、キャンバスが 2:1 のまま中央領域に広がる。右側は `Lighting` と `HDR environment` の2タブで、`Fixed camera` は `Lighting` にある。
+- `3D Preview` をオフにすると 3D 描画を停止し、キャンバスが 2:1 のまま中央領域に広がる。`Fixed camera` は Environment の最上部にある。
 - 約468万三角形のシーンで影・反射の3項目が自動オフになる問題を修正。GPU データを複数ページに分け、単一テクスチャ寸法による上限を外した。当時の修正版は `target/ray-mesh-fix/release/HDR_STUDIO.exe`。
 - 元のマテリアル／テクスチャ、被写界深度、モーションブラー、アニメーション再生、HDF5 ABC、SubD 細分化は未実装。
 
 ### HDR 編集
 
-- **HDR environment** は **Light Layers** の見出し、幅いっぱいの **+ Add Light**、レイヤー一覧、プロパティの順に表示する。Gradient Background は **+ Add Light → Layer properties → Shape** から選ぶ。全天球 HDR の上端から下端へ変化する背景で、色の制御点、明るさと透明度のカーブ、Intensity を編集できる。通常のレイヤー合成、プレビュー、HDR 書き出しと Maya 同期に含める。
-- **Lighting** は上から **Canvas Exposure (EV)**、**Render Preview Exposure (EV)**、常時表示の **Preview Material**、**Default lighting** 以下の設定を表示する。全体の Rotation は削除した。
+- **Lighting** は **Light Layers** の見出し、幅いっぱいの **+ Add Light**、レイヤー一覧、プロパティの順に表示する。Gradient Background は **+ Add Light → Layer properties → Shape** から選ぶ。全天球 HDR の上端から下端へ変化する背景で、色の制御点、明るさと透明度のカーブ、Intensity を編集できる。通常のレイヤー合成、プレビュー、HDR 書き出しと Maya 同期に含める。
+- **Environment** は上から **Fixed camera**、**Exposure**、**Preview Material**、**Lighting**、**Preview Quality** の見出しと区切り線で整理する。全体の Rotation は削除した。
 
 - 2:1 の HDR／EXR は `Shape → Image` レイヤーで読み込み、画像ごとに回転、露出、`Alpha`、`Linear` を設定できる。通常・仕上げ用の HDR と Maya ライブ同期はリニア HDR の合成結果を書き出す。
 - 横幅が 700 px を超える画像は、取り込みと `.lmo` 読み込み時に 700 × 350 px の編集用画像を面積平均で作る。HDR キャンバス、3D 照明、Maya ライブ同期で共有する。小さい画像は元サイズを使用する。仕上げ用 HDR、通常書き出しと `.lmo` 保存は元の RGB32F 画素を使用する。
@@ -85,6 +87,10 @@
 ## 確認方法・結果
 
 ### 確認済み
+
+- **Environment の見出し**。リリース版の実画面で Fixed camera が先頭にあり、Exposure、Preview Material、Lighting、Preview Quality が区切って表示されることを確認した。全58テストが成功した。
+
+- **タブの統合**。リリース版の実画面で File、Lighting、Environment の順序と各操作欄の表示、検証用 Alembic のカメラと読み込み情報が Environment に表示されることを確認した。全58テストが成功した。
 
 - **サイズと Intensity のナッジ**。キーイベントからの増減、位置を保持すること、長押しの Undo／Redo、スライダー範囲、形状別の適用、ロック中の無効化を自動テストで確認した。全58テストと Clippy が成功した。
 

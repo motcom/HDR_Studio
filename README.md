@@ -19,22 +19,22 @@ cargo build --release
 ./target/release/HDR_STUDIO.exe C:/temp/lighting.abc
 ```
 
-**Import Alembic…** またはドラッグ＆ドロップで開きます。右側の **Fixed camera** タブでカメラを選び、読み込み情報を確認できます。画枠はウィンドウの大きさに合わせて拡縮し、アスペクト比を維持します。カメラがない場合はカメラの読み込みを促します。
+**Import Alembic…** またはドラッグ＆ドロップで開きます。右側の **Environment** タブ最上部の **Fixed camera** でカメラを選び、読み込み情報を確認できます。画枠はウィンドウの大きさに合わせて拡縮し、アスペクト比を維持します。カメラがない場合はカメラの読み込みを促します。
 
 ## プロジェクトの保存・読み込み
 
 - **File → New Project** で空のプロジェクトを開始します。
 - **File → Save Project…** で現在のプロジェクトを `.lmo` に保存します。初回は `NewProject.lmo`、以降は開いているプロジェクト名が入力されます。ダイアログで名前と保存先を変更できます。
 - **File → Load Project…** または `.lmo` のドラッグ＆ドロップで開きます。ライトレイヤー、HDR／EXR の画像データ、取り込んだ Alembic、カメラの画角と選択状態をファイル内に保存します。元の `.abc` や `.camera.json`、HDR／EXR が移動しても復元できます。
-- 右側の **File** タブにある **Remove All Models** はモデルをすべて取り除き、カメラは保持します。**Remove Selected Camera** は **Fixed camera** で選択中のカメラを取り除きます。どちらの操作でも HDR レイヤーを保持します。**Import Alembic…** で別のモデルとカメラを読み込むと、同じ照明をそのまま使えます。
+- 右側の **File** タブにある **Remove All Models** はモデルをすべて取り除き、カメラは保持します。**Remove Selected Camera** は **Environment → Fixed camera** で選択中のカメラを取り除きます。どちらの操作でも HDR レイヤーを保持します。**Import Alembic…** で別のモデルとカメラを読み込むと、同じ照明をそのまま使えます。
 
 ## HDR の編集と照明
 
 1. **Import Alembic…** でモデルとカメラを読み込みます。
-2. ライトレイヤーがゼロのときは **Default lighting** が自動でオンになり、内蔵のキーライトとベースの明るさでモデルを表示します。レイヤーがあるときは **Lighting** タブで設定できます。**HDR lighting** は環境光・映り込みをまとめて ON/OFF します。
-3. **HDR environment → + Add Light → Shape → Image → Load HDR / EXR…** で、2:1 の全天球パノラマをレイヤーとして読み込みます。HDR/EXR をウィンドウにドロップしても Image レイヤーを追加できます。HDR キャンバスのダブルクリックでは丸形ライトを追加します。レイヤーを追加するたびに **Default lighting** が自動で OFF になります。
+2. ライトレイヤーがゼロのときは **Default lighting** が自動でオンになり、内蔵のキーライトとベースの明るさでモデルを表示します。レイヤーがあるときは **Environment** タブで設定できます。**HDR lighting** は環境光・映り込みをまとめて ON/OFF します。
+3. **Lighting → + Add Light → Shape → Image → Load HDR / EXR…** で、2:1 の全天球パノラマをレイヤーとして読み込みます。HDR/EXR をウィンドウにドロップしても Image レイヤーを追加できます。HDR キャンバスのダブルクリックでは丸形ライトを追加します。レイヤーを追加するたびに **Default lighting** が自動で OFF になります。
 4. キャンバスのライトをドラッグして移動します。ライトを選ぶと、色・強度・幅・高さ・減衰カーブ・経度・緯度を編集できます。ライトごとに ON/OFF、削除ができます。
-5. **Lighting** タブ上部の **Canvas Exposure (EV)** は HDR Canvas、**Render Preview Exposure (EV)** は 3D プレビューの表示だけに適用します。HDR 書き出しと Maya ライブ同期はレイヤーの合成結果を使用します。Image レイヤーの `Image rotation (°)` は水平方向のオフセット、`Image exposure (EV)` は画像の露出、`Alpha` はレイヤーの不透明度です。`Linear` の既定はオンで、オフにすると入力を sRGB としてリニア RGB に変換します。
+5. **Environment → Exposure** の **Canvas Exposure (EV)** は HDR Canvas、**Render Preview Exposure (EV)** は 3D プレビューの表示だけに適用します。HDR 書き出しと Maya ライブ同期はレイヤーの合成結果を使用します。Image レイヤーの `Image rotation (°)` は水平方向のオフセット、`Image exposure (EV)` は画像の露出、`Alpha` はレイヤーの不透明度です。`Linear` の既定はオンで、オフにすると入力を sRGB としてリニア RGB に変換します。
 6. 右側の **File** タブで **Render size** を選び、**Export HDR…** で照明を合成した Radiance `.hdr` を保存します。1.0 を超える値を保持します。表示用のトーンマッピング、Default lighting、プレビュー材質は書き出しません。
 
 レイヤーは一覧の下から上へ合成します。行の左端にあるハンドルをドラッグすると順序が変わり、行の右側で **Blend** を切り替えられます。鍵アイコンをオンにすると、レイヤーの選択、プロパティの変更、ライトの移動がロックされます。ロック中も合成と並べ替えは有効です。
@@ -57,7 +57,7 @@ Image の既定の Blend は **Over** で、Alpha に応じて下の合成結果
 
 **Shape → Gradient** は片側から反対側へ明るさが変わる矩形です。既定の **Linear** は左から右へ暗くなり、**Gradient direction** で方向を変えられます。**Gradient curve** で始点から終点までを編集できます。キャンバス上で矩形の外形を保つには **Mapping → Flat** を選びます。
 
-**HDR environment → + Add Light** でレイヤーを追加し、**Layer properties → Shape → Gradient Background** を選ぶと、HDR マップ全体を覆う縦方向の背景になります。ほかのライトの下に敷くには、レイヤー行のハンドルで一覧の下に移動します。**Color ramp** で色と色の制御点、**Brightness ramp** で明るさ、**Alpha ramp** で透明度を調整できます。各ランプは上端から下端へ適用されます。
+**Lighting → + Add Light** でレイヤーを追加し、**Layer properties → Shape → Gradient Background** を選ぶと、HDR マップ全体を覆う縦方向の背景になります。ほかのライトの下に敷くには、レイヤー行のハンドルで一覧の下に移動します。**Color ramp** で色と色の制御点、**Brightness ramp** で明るさ、**Alpha ramp** で透明度を調整できます。各ランプは上端から下端へ適用されます。
 
 キャンバス上部の **HDR Canvas** は合成結果にトーンマッピングと sRGB 変換をかけて表示します。**Falloff Preview** は選択中のライトの芯を白の基準にして、減衰をグレースケールで直接表示します。Gradient ではカーブの最大値を白の基準にします。どちらの表示でも見えているライトをドラッグして移動できます。レイヤーのチェックを外すと両方の表示から消えます。3D 照明と書き出しには合成済みのリニア HDR を使います。
 
@@ -65,17 +65,17 @@ Image の既定の Blend は **Over** で、Alpha に応じて下の合成結果
 
 **Shape → Round** は幅と高さを変えると楕円になります。Rectangle と Round では **Hotspot position** の点をドラッグすると、外形を固定したまま明るさの芯が移動します。**Hard cut** をオンにすると、円形ダイヤルか **Cutoff rotation** の数値入力で、切り落とす方向を 0〜360° から指定できます。矢印は切る側を指し、0° は右、90° は下です。**Trim** はその方向に沿った切断線の位置を調整します。50% でライトの中央を通ります。
 
-`HDR background` は固定カメラから見た環境背景を表示します。**Lighting → Preview Material** は 2 つの表示用 Exposure のすぐ下に常時表示され、Roughness / Metallic で映り込みを確認できます。メッシュの元の材質を再現する機能ではありません。カメラの画角は照明編集によって変えません。
+`HDR background` は固定カメラから見た環境背景を表示します。**Environment → Preview Material** は 2 つの表示用 Exposure のすぐ下に常時表示され、Roughness / Metallic で映り込みを確認できます。メッシュの元の材質を再現する機能ではありません。カメラの画角は照明編集によって変えません。
 
-読み込みと書き出しは別スレッドで処理します。インタラクティブな照明確認には 512×256 の HDR テクスチャ、SH による拡散光、ミップマップによる概算の反射を使用します。**Lighting → Preview material → Ray-traced reflections** をオンにすると、滑らかな面に別の面や物体が映り込みます。反射は1段で、粗い面では HDR の近似反射に滑らかに戻ります。書き出しは元の HDR 画像とライト定義から指定解像度で再合成します。
+読み込みと書き出しは別スレッドで処理します。インタラクティブな照明確認には 512×256 の HDR テクスチャ、SH による拡散光、ミップマップによる概算の反射を使用します。**Environment → Preview Material → Ray-traced reflections** をオンにすると、滑らかな面に別の面や物体が映り込みます。反射は1段で、粗い面では HDR の近似反射に滑らかに戻ります。書き出しは元の HDR 画像とライト定義から指定解像度で再合成します。
 
 Image レイヤーは元の解像度の RGB32F 画素を保持します。横幅が 700 px を超える HDR／EXR は、読み込み時に面積平均で 700 × 350 px の編集用画像を作り、HDR キャンバス、3D 照明、Maya のライブ同期に再利用します。横幅が 700 px 以下の画像はそのサイズで使います。`.lmo` には元解像度の画素を保存し、開くと編集用画像を作り直します。
 
-**Lighting → HDR soft shadows** はモデル表面に、**Show floor shadows** はモデルの最下部に合わせた床に HDR の影を表示します。両方とも **HDR lighting** がオンのときに使えます。HDRI 上で光源の見かけの幅が広いほど、影の縁は柔らかくなります。床と表面の影はプレビュー用です。
+**Environment → Lighting → HDR soft shadows** はモデル表面に、**Show floor shadows** はモデルの最下部に合わせた床に HDR の影を表示します。両方とも **HDR lighting** がオンのときに使えます。HDRI 上で光源の見かけの幅が広いほど、影の縁は柔らかくなります。床と表面の影はプレビュー用です。
 
-3D プレビューは専用スレッドの OpenGL で描画します。**Lighting** の `Min shadow samples` と `Min preview resolution` は操作中の値で、既定は4サンプル・50%です。アイドル時は `Idle shadow samples` と `Idle preview resolution` の上限まで段階的に上がり、操作を再開すると最小値に戻ります。上限の既定は32サンプル・100%です。影サンプル数は表面と床に共通で、解像度の倍率は3D表示枠の物理ピクセル数に対して適用します。現在表示している品質は Lighting タブの `Preview` 欄に表示します。影のサンプルを画素ごとに変えるため、半影は静止時にもちらつかない粒状になります。
+3D プレビューは専用スレッドの OpenGL で描画します。**Environment → Preview Quality** の `Min shadow samples` と `Min preview resolution` は操作中の値で、既定は4サンプル・50%です。アイドル時は `Idle shadow samples` と `Idle preview resolution` の上限まで段階的に上がり、操作を再開すると最小値に戻ります。上限の既定は32サンプル・100%です。影サンプル数は表面と床に共通で、解像度の倍率は3D表示枠の物理ピクセル数に対して適用します。現在の描画品質は **Preview Quality** の末尾に表示します。影のサンプルを画素ごとに変えるため、半影は静止時にもちらつかない粒状になります。
 
-Lighting の設定は `%LOCALAPPDATA%/HDR STUDIO/settings.json` に保存し、次回起動時に復元します。ライトレイヤーが空の起動時は **Default lighting** がオンです。HDR lighting、HDR background、HDR soft shadows の既定値もオンです。
+Environment のプレビュー設定は `%LOCALAPPDATA%/HDR STUDIO/settings.json` に保存し、次回起動時に復元します。ライトレイヤーが空の起動時は **Default lighting** がオンです。HDR lighting、HDR background、HDR soft shadows の既定値もオンです。
 
 影と反射のレイ追跡データは複数のテクスチャページに分けて GPU に送ります。扱えるシーンの大きさは GPU メモリ、テクスチャ配列の容量、PC のメモリに依存します。転送できない場合はステータス欄に原因を表示します。
 

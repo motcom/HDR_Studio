@@ -1363,7 +1363,8 @@ impl Editor {
             }
         }
     }
-    pub fn lighting_controls(&mut self, ui: &mut egui::Ui) {
+    pub fn environment_controls(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Exposure");
         ui.add(
             egui::Slider::new(&mut self.lighting.canvas_exposure_ev, -10.0..=10.0)
                 .text("Canvas Exposure (EV)"),
@@ -1385,6 +1386,7 @@ impl Editor {
 
         ui.add_space(4.0);
         ui.separator();
+        ui.strong("Lighting");
         ui.add_enabled(
             self.has_light_layers(),
             egui::Checkbox::new(&mut self.lighting.default_light, "Default lighting"),
@@ -1399,6 +1401,17 @@ impl Editor {
             .on_hover_text("Cast shadows from the HDR environment onto model surfaces.");
         ui.checkbox(&mut self.lighting.floor_shadows, "Show floor shadows")
             .on_hover_text("Catch HDR shadows on a floor at the bottom of the model.");
+        if !self.lighting.environment
+            && (self.lighting.soft_shadows
+                || self.lighting.floor_shadows
+                || self.lighting.ray_reflections)
+        {
+            ui.small("Enable HDR lighting to preview HDR shadows and reflections.");
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+        ui.strong("Preview Quality");
         preview_quality_options(
             ui,
             "Min shadow samples",
@@ -1439,16 +1452,9 @@ impl Editor {
             self.lighting.preview_scale,
             "%",
         );
-        if !self.lighting.environment
-            && (self.lighting.soft_shadows
-                || self.lighting.floor_shadows
-                || self.lighting.ray_reflections)
-        {
-            ui.small("Enable HDR lighting to preview HDR shadows and reflections.");
-        }
     }
 
-    pub fn environment_controls(&mut self, ui: &mut egui::Ui) {
+    pub fn layer_controls(&mut self, ui: &mut egui::Ui) {
         if !self.composite_parents.is_empty() {
             if ui
                 .add_enabled(self.importing.is_none(), egui::Button::new("Back"))

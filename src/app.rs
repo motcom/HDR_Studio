@@ -33,10 +33,9 @@ enum FileCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InspectorTab {
-    Lighting,
-    FixedCamera,
-    HdrEnvironment,
     File,
+    Lighting,
+    Environment,
 }
 
 struct LightStroke {
@@ -104,7 +103,7 @@ impl App {
             initial,
             editor,
             settings,
-            inspector_tab: InspectorTab::Lighting,
+            inspector_tab: InspectorTab::Environment,
             light_paint: LightPaint::default(),
             light_stroke: None,
             placement_status: String::new(),
@@ -559,7 +558,7 @@ impl App {
             ui.small("No models loaded.");
             return;
         };
-        ui.separator();
+        ui.add_space(3.0);
         ui.label(scene.path.file_name().unwrap_or_default().to_string_lossy());
         ui.label(format!(
             "{} meshes · {} triangles",
@@ -674,17 +673,17 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (tab, label) in [
-                        (InspectorTab::Lighting, "Lighting"),
-                        (InspectorTab::FixedCamera, "Fixed camera"),
-                        (InspectorTab::HdrEnvironment, "HDR environment"),
                         (InspectorTab::File, "File"),
+                        (InspectorTab::Lighting, "Lighting"),
+                        (InspectorTab::Environment, "Environment"),
                     ] {
                         ui.selectable_value(&mut self.inspector_tab, tab, label);
                     }
                 });
                 ui.separator();
-                let scroll_source = if self.inspector_tab == InspectorTab::HdrEnvironment {
-                    egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL
+                let scroll_source = if self.inspector_tab == InspectorTab::Lighting {
+                    egui::scroll_area::ScrollSource::SCROLL_BAR
+                        | egui::scroll_area::ScrollSource::MOUSE_WHEEL
                 } else {
                     egui::scroll_area::ScrollSource::ALL
                 };
@@ -692,26 +691,40 @@ impl eframe::App for App {
                     .id_salt(egui::Id::new("inspector-scroll").with(self.inspector_tab as u8))
                     .scroll_source(scroll_source)
                     .show(ui, |ui| match self.inspector_tab {
-                        InspectorTab::Lighting => {
-                            self.editor.lighting_controls(ui);
-                            if let Some(([width, height], scale, samples)) = self.preview.quality() {
-                                ui.small(format!("Preview: {width} × {height} px ({scale}%) · {samples} shadow samples"));
+                        InspectorTab::Lighting => self.editor.layer_controls(ui),
+                        InspectorTab::Environment => {
+                            ui.strong("Fixed camera");
+                            self.camera_controls(ui);
+                            ui.add_space(4.0);
+                            ui.separator();
+                            self.editor.environment_controls(ui);
+                            if let Some(([width, height], scale, samples)) = self.preview.quality()
+                            {
+                                ui.small(format!(
+                                    "{width} × {height} px ({scale}%) · {samples} shadow samples"
+                                ));
                             }
                         }
-                        InspectorTab::FixedCamera => self.camera_controls(ui),
-                        InspectorTab::HdrEnvironment => self.editor.environment_controls(ui),
                         InspectorTab::File => {
                             let size = egui::vec2(ui.available_width(), 28.0);
                             self.editor.file_controls(ui, size);
                             ui.separator();
                             ui.strong("Scene");
-                            if ui.add_enabled(available && self.scene.is_some(),
-                                egui::Button::new("Remove All Models").min_size(size)).clicked()
+                            if ui
+                                .add_enabled(
+                                    available && self.scene.is_some(),
+                                    egui::Button::new("Remove All Models").min_size(size),
+                                )
+                                .clicked()
                             {
                                 command = Some(FileCommand::RemoveModels);
                             }
-                            if ui.add_enabled(available && self.selected_camera().is_some(),
-                                egui::Button::new("Remove Selected Camera").min_size(size)).clicked()
+                            if ui
+                                .add_enabled(
+                                    available && self.selected_camera().is_some(),
+                                    egui::Button::new("Remove Selected Camera").min_size(size),
+                                )
+                                .clicked()
                             {
                                 command = Some(FileCommand::RemoveCamera);
                             }
